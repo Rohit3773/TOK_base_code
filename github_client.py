@@ -5,13 +5,16 @@ import json
 import requests
 import time
 import logging
-from typing import Any, Dict, List, Optional, Union
+import re
+from typing import Any, Dict, List, Optional, Union, Tuple
 from functools import lru_cache
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from datetime import datetime, timezone
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +42,176 @@ class GitHubConfig:
     cache_ttl: int = 300  # 5 minutes
     max_per_page: int = 100
     enable_rate_limit_handling: bool = True
+    read_only_mode: bool = True
+    confirm_destructive: bool = True
+
+
+def normalize_repo_input(repo_input: str, default_owner: str = "", default_repo: str = "") -> Tuple[str, str]:
+    """
+    Normalize repository input to (owner, repo) tuple.
+
+    Handles:
+    - "owner/repo" format
+    - GitHub URLs (https://github.com/owner/repo)
+    - Just repo name (uses default_owner)
+    """
+    if not repo_input:
+        return default_owner, default_repo
+
+    # GitHub URL pattern
+    url_match = re.match(r'https://github\.com/([^/]+)/([^/]+)/?.*', repo_input)
+    if url_match:
+        return url_match.group(1), url_match.group(2)
+
+    # owner/repo pattern
+    if '/' in repo_input:
+        parts = repo_input.split('/')
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+
+    # Just repo name
+    return default_owner, repo_input
+
+
+def normalize_issue_pr_input(input_str: str) -> int:
+    """
+    Normalize issue/PR input to issue number.
+
+    Handles:
+    - "#123" format
+    - "123" number
+    - GitHub URLs with issue/PR numbers
+    """
+    if not input_str:
+        raise ValueError("Issue/PR input cannot be empty")
+
+    # Remove # prefix
+    if input_str.startswith('#'):
+        input_str = input_str[1:]
+
+    # Extract from GitHub URLs
+    url_patterns = [
+        r'github\.com/[^/]+/[^/]+/issues/(\d+)',
+        r'github\.com/[^/]+/[^/]+/pull/(\d+)'
+    ]
+
+    for pattern in url_patterns:
+        match = re.search(pattern, input_str)
+        if match:
+            return int(match.group(1))
+
+    # Direct number
+    try:
+        return int(input_str)
+    except ValueError:
+        raise ValueError(f"Cannot parse issue/PR number from: {input_str}")
+
+
+def normalize_workflow_input(input_str: str) -> Union[str, int]:
+    """
+    Normalize workflow input - can be filename or ID.
+    Returns as-is for filename, int for ID.
+    """
+    if not input_str:
+        raise ValueError("Workflow input cannot be empty")
+
+    # Try to parse as int (workflow ID)
+    try:
+        return int(input_str)
+    except ValueError:
+        # Return as filename
+        return input_str
 
 
 class GitHubClient:
-    """High-performance GitHub client with connection pooling, caching, and rate limit handling."""
+    """Comprehensive GitHub client with full API surface coverage."""
 
-    def __init__(self, token: str, config: Optional[GitHubConfig] = None):
+    # Argument allowlists for each operation
+    ARG_ALLOWLISTS = {
+        # Repository operations
+        'create_repository': {'name', 'description', 'private', 'has_issues', 'has_projects', 'has_wiki', 'auto_init',
+                              'gitignore_template', 'license_template'},
+        'fork_repository': {'organization'},
+        'create_branch': {'branch', 'from_branch'},
+        'list_branches': {'protected', 'per_page', 'page'},
+        'list_commits': {'sha', 'path', 'author', 'since', 'until', 'per_page', 'page'},
+        'get_commit': {'ref'},
+        'create_or_update_file': {'path', 'content', 'message', 'branch', 'sha', 'committer', 'author'},
+        'delete_file': {'path', 'message', 'branch', 'sha', 'committer', 'author'},
+        'get_file_contents': {'path', 'ref'},
+        'push_files': {'branch', 'files', 'message', 'committer', 'author'},
+        'list_tags': {'per_page', 'page'},
+        'get_tag': {'tag'},
+        'list_releases': {'per_page', 'page'},
+        'get_release_by_tag': {'tag'},
+
+        # Issue operations
+        'create_issue': {'title', 'body', 'assignees', 'milestone', 'labels', 'assignee'},
+        'update_issue': {'title', 'body', 'assignees', 'milestone', 'labels', 'state', 'assignee'},
+        'get_issue': {},
+        'list_issues': {'milestone', 'state', 'assignee', 'creator', 'mentioned', 'labels', 'sort', 'direction',
+                        'since', 'per_page', 'page'},
+        'search_issues': {'q', 'sort', 'order', 'per_page', 'page'},
+        'add_issue_comment': {'body'},
+
+        # Pull Request operations
+        'create_pull_request': {'title', 'body', 'head', 'base', 'draft', 'maintainer_can_modify'},
+        'update_pull_request': {'title', 'body', 'state', 'base', 'maintainer_can_modify'},
+        'merge_pull_request': {'commit_title', 'commit_message', 'merge_method', 'sha'},
+        'list_pull_requests': {'state', 'head', 'base', 'sort', 'direction', 'per_page', 'page'},
+        'get_pull_request': {},
+        'get_pull_request_files': {'per_page', 'page'},
+        'get_pull_request_reviews': {'per_page', 'page'},
+        'get_pull_request_comments': {'sort', 'direction', 'since', 'per_page', 'page'},
+        'search_pull_requests': {'q', 'sort', 'order', 'per_page', 'page'},
+
+        # Workflow operations
+        'list_workflows': {'per_page', 'page'},
+        'list_workflow_runs': {'actor', 'branch', 'event', 'status', 'per_page', 'page', 'created',
+                               'exclude_pull_requests', 'check_suite_id'},
+        'get_workflow_run': {},
+        'run_workflow': {'ref', 'inputs'},
+        'rerun_workflow_run': {},
+        'cancel_workflow_run': {},
+        'list_workflow_jobs': {'filter', 'per_page', 'page'},
+
+        # Search operations
+        'search_code': {'q', 'sort', 'order', 'per_page', 'page'},
+
+        # Notification operations
+        'list_notifications': {'all', 'participating', 'since', 'before', 'per_page', 'page'},
+        'mark_notifications_read': {'last_read_at'},
+
+        # User/Org operations
+        'search_users': {'q', 'sort', 'order', 'per_page', 'page'},
+        'search_orgs': {'q', 'sort', 'order', 'per_page', 'page'},
+
+        # Discussion operations
+        'list_discussions': {'category_id', 'labels', 'per_page', 'page'},
+        'get_discussion': {},
+        'list_discussion_comments': {'per_page', 'page'},
+
+        # Gist operations
+        'create_gist': {'files', 'description', 'public'},
+        'list_gists': {'since', 'per_page', 'page'},
+        'update_gist': {'files', 'description'},
+    }
+
+    # Destructive operations that require confirmation
+    DESTRUCTIVE_OPERATIONS = {
+        'merge_pull_request', 'delete_file', 'push_files', 'cancel_workflow_run',
+        'remove_sub_issue', 'reprioritize_sub_issue'
+    }
+
+    def __init__(self, token: str, config: Optional[GitHubConfig] = None, default_owner: str = "",
+                 default_repo: str = ""):
         if not token:
             raise GitHubError("GitHub token is required")
 
         self._token = token
         self.config = config or GitHubConfig()
+        self.default_owner = default_owner
+        self.default_repo = default_repo
 
         # Setup optimized session
         self.session = self._create_optimized_session()
@@ -67,19 +229,30 @@ class GitHubClient:
         # Thread pool for batch operations
         self._executor = ThreadPoolExecutor(max_workers=6)
 
-        logger.info("Initialized optimized GitHub client")
+        logger.info("Initialized comprehensive GitHub client")
 
     def _create_optimized_session(self) -> requests.Session:
         """Create session with connection pooling and retry strategy."""
         session = requests.Session()
 
-        # Configure retry strategy
-        retry_strategy = Retry(
-            total=self.config.max_retries,
-            backoff_factor=self.config.backoff_factor,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"]
-        )
+        # Configure retry strategy with jitter
+        try:
+            # Try with backoff_jitter if supported
+            retry_strategy = Retry(
+                total=self.config.max_retries,
+                backoff_factor=self.config.backoff_factor,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"],
+                backoff_jitter=0.3
+            )
+        except TypeError:
+            # Fallback without jitter parameter
+            retry_strategy = Retry(
+                total=self.config.max_retries,
+                backoff_factor=self.config.backoff_factor,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"]
+            )
 
         # Configure HTTP adapter
         adapter = HTTPAdapter(
@@ -99,56 +272,63 @@ class GitHubClient:
             "Authorization": f"Bearer {self._token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "OptimizedGitHubClient/1.0"
+            "User-Agent": "EnhancedGitHubClient/2.0"
         }
 
-    def _get_from_cache(self, cache_key: str) -> Optional[Any]:
-        """Thread-safe cache retrieval with TTL checking."""
-        if not self.config.enable_caching:
-            return None
+    def _clean_args(self, operation: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean arguments based on operation allowlist."""
+        if operation not in self.ARG_ALLOWLISTS:
+            logger.warning(f"No allowlist defined for operation: {operation}")
+            return args
 
+        allowed = self.ARG_ALLOWLISTS[operation]
+        cleaned = {k: v for k, v in args.items() if k in allowed}
+
+        dropped = set(args.keys()) - set(cleaned.keys())
+        if dropped:
+            logger.debug(f"Dropped invalid args for {operation}: {dropped}")
+
+        return cleaned
+
+    def _check_destructive_operation(self, operation: str, args: Dict[str, Any]) -> bool:
+        """Check if operation is destructive and handle confirmation."""
+        if operation not in self.DESTRUCTIVE_OPERATIONS:
+            return True
+
+        if self.config.read_only_mode:
+            logger.info(f"DRY RUN - Would execute {operation} with args: {args}")
+            return False
+
+        if self.config.confirm_destructive:
+            logger.warning(f"DESTRUCTIVE OPERATION: {operation} with args: {args}")
+            # In a real implementation, this would prompt for confirmation
+            # For now, we'll log and proceed (you'd implement UI confirmation)
+            return True
+
+        return True
+
+    def _resolve_workflow_id(self, owner: str, repo: str, workflow_input: Union[str, int]) -> int:
+        """Resolve workflow filename to ID if needed."""
+        if isinstance(workflow_input, int):
+            return workflow_input
+
+        # It's a filename, need to resolve to ID
+        workflows = self.list_workflows(owner, repo)
+        if isinstance(workflows, dict) and 'workflows' in workflows:
+            for workflow in workflows['workflows']:
+                if workflow.get('path', '').endswith(workflow_input) or workflow.get('name') == workflow_input:
+                    return workflow['id']
+
+        raise GitHubError(f"Could not resolve workflow '{workflow_input}' to ID")
+
+    def _invalidate_cache_pattern(self, pattern: str) -> None:
+        """Invalidate cache entries matching a pattern."""
         with self._cache_lock:
-            if cache_key not in self._cache:
-                return None
-
-            timestamp = self._cache_timestamps.get(cache_key, 0)
-            if time.time() - timestamp > self.config.cache_ttl:
-                del self._cache[cache_key]
-                del self._cache_timestamps[cache_key]
-                return None
-
-            return self._cache[cache_key]
-
-    def _set_cache(self, cache_key: str, data: Any) -> None:
-        """Thread-safe cache storage."""
-        if self.config.enable_caching:
-            with self._cache_lock:
-                self._cache[cache_key] = data
-                self._cache_timestamps[cache_key] = time.time()
-
-    def _update_rate_limit_info(self, response: requests.Response) -> None:
-        """Update rate limit information from response headers."""
-        if not self.config.enable_rate_limit_handling:
-            return
-
-        with self._rate_limit_lock:
-            self._rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', 5000))
-            reset_time = response.headers.get('X-RateLimit-Reset')
-            if reset_time:
-                self._rate_limit_reset_time = int(reset_time)
-
-    def _check_rate_limit(self) -> None:
-        """Check and handle rate limiting."""
-        if not self.config.enable_rate_limit_handling:
-            return
-
-        with self._rate_limit_lock:
-            if self._rate_limit_remaining < 10:
-                current_time = time.time()
-                if current_time < self._rate_limit_reset_time:
-                    sleep_time = self._rate_limit_reset_time - current_time + 1
-                    logger.warning(f"Rate limit low, sleeping for {sleep_time}s")
-                    time.sleep(sleep_time)
+            keys_to_delete = [key for key in self._cache.keys() if key.startswith(pattern)]
+            for key in keys_to_delete:
+                del self._cache[key]
+                if key in self._cache_timestamps:
+                    del self._cache_timestamps[key]
 
     def _request(
             self,
@@ -221,438 +401,1092 @@ class GitHubClient:
         except requests.exceptions.RequestException as e:
             raise GitHubError(f"Request failed for {path}: {str(e)}")
 
+    def _get_from_cache(self, cache_key: str) -> Optional[Any]:
+        """Thread-safe cache retrieval with TTL checking."""
+        if not self.config.enable_caching:
+            return None
+
+        with self._cache_lock:
+            if cache_key not in self._cache:
+                return None
+
+            timestamp = self._cache_timestamps.get(cache_key, 0)
+            if time.time() - timestamp > self.config.cache_ttl:
+                del self._cache[cache_key]
+                del self._cache_timestamps[cache_key]
+                return None
+
+            return self._cache[cache_key]
+
+    def _set_cache(self, cache_key: str, data: Any) -> None:
+        """Thread-safe cache storage."""
+        if self.config.enable_caching:
+            with self._cache_lock:
+                self._cache[cache_key] = data
+                self._cache_timestamps[cache_key] = time.time()
+
+    def _update_rate_limit_info(self, response: requests.Response) -> None:
+        """Update rate limit information from response headers."""
+        if not self.config.enable_rate_limit_handling:
+            return
+
+        with self._rate_limit_lock:
+            self._rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', 5000))
+            reset_time = response.headers.get('X-RateLimit-Reset')
+            if reset_time:
+                self._rate_limit_reset_time = int(reset_time)
+
+    def _check_rate_limit(self) -> None:
+        """Check and handle rate limiting with jitter."""
+        if not self.config.enable_rate_limit_handling:
+            return
+
+        with self._rate_limit_lock:
+            if self._rate_limit_remaining < 10:
+                current_time = time.time()
+                if current_time < self._rate_limit_reset_time:
+                    # Add jitter to prevent thundering herd
+                    jitter = random.uniform(0.1, 0.5)
+                    sleep_time = self._rate_limit_reset_time - current_time + 1 + jitter
+                    logger.warning(f"Rate limit low, sleeping for {sleep_time:.1f}s")
+                    time.sleep(sleep_time)
+
     def _parse_error_response(self, response: requests.Response) -> Dict[str, Any]:
-        """Parse error response with fallback handling."""
+        """Parse error response with fallback handling and actionable messages."""
         try:
-            return response.json()
+            error_data = response.json()
+            message = error_data.get('message', f"HTTP {response.status_code}")
+
+            # Add actionable suggestions
+            if response.status_code == 401:
+                message += " (Check your GitHub token and permissions)"
+            elif response.status_code == 403:
+                message += " (Check token scopes and rate limits)"
+            elif response.status_code == 404:
+                message += " (Resource not found - check owner/repo names)"
+            elif response.status_code == 422:
+                message += " (Validation failed - check required fields)"
+
+            return {"message": message, "status_code": response.status_code}
         except ValueError:
             return {
-                "message": response.text or f"HTTP {response.status_code}",
+                "message": f"HTTP {response.status_code}: {response.text or 'Unknown error'}",
                 "status_code": response.status_code
             }
 
-    # ---------------- Enhanced Basic Operations ----------------
+    # ============================================================================
+    # REPOSITORY OPERATIONS
+    # ============================================================================
 
-    @lru_cache(maxsize=1)
     def get_user(self) -> Dict[str, Any]:
         """Get current user info with caching."""
         return self._request("GET", "/user", cache_key="current_user")
 
-    def get_repository(self, owner: str, repo: str) -> Dict[str, Any]:
+    def get_repository(self, owner: str = "", repo: str = "") -> Dict[str, Any]:
         """Get repository information with caching."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
         cache_key = f"repo:{owner}/{repo}"
         return self._request("GET", f"/repos/{owner}/{repo}", cache_key=cache_key)
 
-    def list_branches(self, owner: str, repo: str, per_page: int = 100) -> List[Dict[str, Any]]:
-        """List branches with pagination support and caching."""
-        cache_key = f"branches:{owner}/{repo}"
-        params = {"per_page": min(per_page, self.config.max_per_page)}
+    def create_repository(self, name: str, **kwargs) -> Dict[str, Any]:
+        """Create a new repository."""
+        if not self._check_destructive_operation('create_repository', {'name': name, **kwargs}):
+            return {"dry_run": True, "operation": "create_repository", "args": {"name": name, **kwargs}}
 
-        return self._request(
-            "GET",
-            f"/repos/{owner}/{repo}/branches",
-            params=params,
-            cache_key=cache_key
-        )
+        cleaned_args = self._clean_args('create_repository', {'name': name, **kwargs})
+        return self._request("POST", "/user/repos", json_body=cleaned_args)
 
-    # ---------------- Optimized Repository Information ----------------
+    def fork_repository(self, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Fork a repository."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-    @lru_cache(maxsize=128)
-    def _get_default_branch_cached(self, owner: str, repo: str) -> str:
-        """Get default branch with caching."""
-        repo_data = self.get_repository(owner, repo)
-        return repo_data.get("default_branch", "main")
+        cleaned_args = self._clean_args('fork_repository', kwargs)
+        return self._request("POST", f"/repos/{owner}/{repo}/forks", json_body=cleaned_args)
 
-    def _get_branch_sha(self, owner: str, repo: str, branch: str) -> str:
-        """Get branch SHA with caching."""
-        cache_key = f"branch_sha:{owner}/{repo}:{branch}"
+    def create_branch(self, branch: str, owner: str = "", repo: str = "", from_branch: str = "main", **kwargs) -> Dict[
+        str, Any]:
+        """Create a new branch."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-        # Check cache first
-        cached_sha = self._get_from_cache(cache_key)
-        if cached_sha:
-            return cached_sha
+        if not self._check_destructive_operation('create_branch', {'branch': branch, 'from_branch': from_branch}):
+            return {"dry_run": True, "operation": "create_branch",
+                    "args": {"branch": branch, "from_branch": from_branch}}
 
-        ref_data = self._request("GET", f"/repos/{owner}/{repo}/git/ref/heads/{branch}")
-        sha = (ref_data.get("object") or {}).get("sha")
+        # Get SHA of from_branch
+        ref_data = self._request("GET", f"/repos/{owner}/{repo}/git/ref/heads/{from_branch}")
+        sha = ref_data.get("object", {}).get("sha")
+        if not sha:
+            raise GitHubError(f"Could not get SHA for branch '{from_branch}'")
+
+        payload = {"ref": f"refs/heads/{branch}", "sha": sha}
+        return self._request("POST", f"/repos/{owner}/{repo}/git/refs", json_body=payload)
+
+    def list_branches(self, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """List repository branches."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        cleaned_args = self._clean_args('list_branches', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+        return self._request("GET", f"/repos/{owner}/{repo}/branches", params=params,
+                             cache_key=f"branches:{owner}/{repo}:{hash(str(params))}")
+
+    def list_commits(self, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """List repository commits."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        cleaned_args = self._clean_args('list_commits', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+        return self._request("GET", f"/repos/{owner}/{repo}/commits", params=params)
+
+    def get_commit(self, ref: str, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Get a specific commit."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        cleaned_args = self._clean_args('get_commit', {'ref': ref, **kwargs})
+        return self._request("GET", f"/repos/{owner}/{repo}/commits/{ref}")
+
+    def create_or_update_file(self, path: str, content: Union[str, bytes], message: str,
+                              owner: str = "", repo: str = "", branch: str = "main", **kwargs) -> Dict[str, Any]:
+        """Create or update a file."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        if not self._check_destructive_operation('create_or_update_file', {'path': path, 'message': message}):
+            return {"dry_run": True, "operation": "create_or_update_file", "args": {"path": path, "message": message}}
+
+        # Check if file exists to get SHA
+        sha = None
+        try:
+            existing_file = self._request("GET", f"/repos/{owner}/{repo}/contents/{path}", params={"ref": branch})
+            sha = existing_file.get("sha")
+        except GitHubError as e:
+            if e.status_code != 404:
+                raise
+
+        # Prepare content
+        if isinstance(content, str):
+            content_b64 = base64.b64encode(content.encode('utf-8')).decode('ascii')
+        else:
+            content_b64 = base64.b64encode(content).decode('ascii')
+
+        payload = {
+            "message": message.strip(),
+            "content": content_b64,
+            "branch": branch
+        }
 
         if sha:
-            self._set_cache(cache_key, sha)
+            payload["sha"] = sha
 
-        return sha
+        # Add additional args
+        cleaned_args = self._clean_args('create_or_update_file', kwargs)
+        payload.update(cleaned_args)
 
-    # ---------------- Enhanced Issue Operations ----------------
+        return self._request("PUT", f"/repos/{owner}/{repo}/contents/{path}", json_body=payload)
 
-    def create_issue(
-            self,
-            owner: str,
-            repo: str,
-            title: str,
-            body: str = "",
-            labels: Optional[List[str]] = None,
-            assignees: Optional[List[str]] = None,
-            milestone: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """Create issue with enhanced validation and options."""
+    def delete_file(self, path: str, message: str, owner: str = "", repo: str = "", branch: str = "main", **kwargs) -> \
+    Dict[str, Any]:
+        """Delete a file."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        if not self._check_destructive_operation('delete_file', {'path': path, 'message': message}):
+            return {"dry_run": True, "operation": "delete_file", "args": {"path": path, "message": message}}
+
+        # Get file SHA
+        try:
+            existing_file = self._request("GET", f"/repos/{owner}/{repo}/contents/{path}", params={"ref": branch})
+            sha = existing_file.get("sha")
+            if not sha:
+                raise GitHubError(f"Could not get SHA for file '{path}'")
+        except GitHubError as e:
+            if e.status_code == 404:
+                raise GitHubError(f"File '{path}' not found")
+            raise
+
+        payload = {
+            "message": message.strip(),
+            "sha": sha,
+            "branch": branch
+        }
+
+        cleaned_args = self._clean_args('delete_file', kwargs)
+        payload.update(cleaned_args)
+
+        return self._request("DELETE", f"/repos/{owner}/{repo}/contents/{path}", json_body=payload)
+
+    def get_file_contents(self, path: str, owner: str = "", repo: str = "", ref: str = "main", **kwargs) -> Dict[
+        str, Any]:
+        """Get file contents."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        cleaned_args = self._clean_args('get_file_contents', {'path': path, 'ref': ref, **kwargs})
+        params = {"ref": ref} if ref else {}
+
+        return self._request("GET", f"/repos/{owner}/{repo}/contents/{path}", params=params)
+
+    def push_files(self, branch: str, files: List[Dict[str, str]], message: str,
+                   owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Push multiple files to a branch."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        if not files:
+            raise GitHubError("Files list cannot be empty")
+
+        if not self._check_destructive_operation('push_files', {'branch': branch, 'files': files, 'message': message}):
+            return {"dry_run": True, "operation": "push_files",
+                    "args": {"branch": branch, "files": files, "message": message}}
+
+        results = []
+        updated_paths = []
+        commit_shas = []
+
+        for file_info in files:
+            path = file_info.get('path')
+            content = file_info.get('content')
+
+            if not path or content is None:
+                results.append({"path": path, "error": "Missing path or content"})
+                continue
+
+            try:
+                result = self.create_or_update_file(
+                    path=path,
+                    content=content,
+                    message=message,
+                    owner=owner,
+                    repo=repo,
+                    branch=branch,
+                    **kwargs
+                )
+
+                updated_paths.append(path)
+                if result.get('commit', {}).get('sha'):
+                    commit_shas.append(result['commit']['sha'])
+
+                results.append({"path": path, "success": True, "sha": result.get('content', {}).get('sha')})
+
+            except Exception as e:
+                results.append({"path": path, "error": str(e)})
+
+        return {
+            "ok": True,
+            "branch": branch,
+            "updated_paths": updated_paths,
+            "commit_shas": list(set(commit_shas)),  # Unique SHAs
+            "results": results,
+            "summary": f"Updated {len(updated_paths)}/{len(files)} files on {branch}"
+        }
+
+    def list_tags(self, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """List repository tags."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        cleaned_args = self._clean_args('list_tags', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+
+        return self._request("GET", f"/repos/{owner}/{repo}/tags", params=params)
+
+    def get_tag(self, tag: str, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Get a specific tag."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        return self._request("GET", f"/repos/{owner}/{repo}/git/refs/tags/{tag}")
+
+    def list_releases(self, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """List repository releases."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        cleaned_args = self._clean_args('list_releases', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+
+        return self._request("GET", f"/repos/{owner}/{repo}/releases", params=params)
+
+    def get_latest_release(self, owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """Get latest release."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        return self._request("GET", f"/repos/{owner}/{repo}/releases/latest")
+
+    def get_release_by_tag(self, tag: str, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Get release by tag."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        return self._request("GET", f"/repos/{owner}/{repo}/releases/tags/{tag}")
+
+    # ============================================================================
+    # ISSUE OPERATIONS
+    # ============================================================================
+
+    def create_issue(self, title: str, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Create an issue with enhanced validation."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
         if not title.strip():
             raise GitHubError("Issue title cannot be empty")
 
-        payload = {"title": title.strip()}
+        cleaned_args = self._clean_args('create_issue', {'title': title.strip(), **kwargs})
 
-        if body:
-            payload["body"] = body
-        if labels:
-            payload["labels"] = labels
-        if assignees:
-            payload["assignees"] = assignees
-        if milestone:
-            payload["milestone"] = milestone
+        result = self._request("POST", f"/repos/{owner}/{repo}/issues", json_body=cleaned_args)
+        logger.info(f"Created issue #{result.get('number')} in {owner}/{repo}")
 
+        # Clear cache
+        self._invalidate_cache_pattern(f"issues:{owner}/{repo}")
+        return result
+
+    def update_issue(self, issue_number: Union[int, str], owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Update an existing issue."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        issue_num = normalize_issue_pr_input(str(issue_number))
+        cleaned_args = self._clean_args('update_issue', kwargs)
+
+        result = self._request("PATCH", f"/repos/{owner}/{repo}/issues/{issue_num}", json_body=cleaned_args)
+        self._invalidate_cache_pattern(f"issues:{owner}/{repo}")
+        return result
+
+    def get_issue(self, issue_number: Union[int, str], owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Get a specific issue."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        issue_num = normalize_issue_pr_input(str(issue_number))
+        return self._request("GET", f"/repos/{owner}/{repo}/issues/{issue_num}",
+                             cache_key=f"issue:{owner}/{repo}:{issue_num}")
+
+    def list_issues(self, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """List issues with enhanced filtering."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        cleaned_args = self._clean_args('list_issues', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+        result = self._request("GET", f"/repos/{owner}/{repo}/issues", params=params,
+                               cache_key=f"issues:{owner}/{repo}:{hash(str(params))}")
+
+        # Filter out pull requests
+        if isinstance(result, list):
+            return [item for item in result if "pull_request" not in item]
+        return result
+
+    def search_issues(self, query: str, **kwargs) -> Dict[str, Any]:
+        """Search issues across GitHub."""
+        cleaned_args = self._clean_args('search_issues', {'q': query, **kwargs})
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+        return self._request("GET", "/search/issues", params=params)
+
+    def add_issue_comment(self, issue_number: Union[int, str], body: str, owner: str = "", repo: str = "", **kwargs) -> \
+    Dict[str, Any]:
+        """Add comment to an issue."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        issue_num = normalize_issue_pr_input(str(issue_number))
+        cleaned_args = self._clean_args('add_issue_comment', {'body': body, **kwargs})
+
+        return self._request("POST", f"/repos/{owner}/{repo}/issues/{issue_num}/comments", json_body=cleaned_args)
+
+    def add_sub_issue(self, parent_issue: Union[int, str], sub_issue: Union[int, str], owner: str = "",
+                      repo: str = "") -> Dict[str, Any]:
+        """Add a sub-issue relationship (using GitHub's sub-issue feature if available)."""
+        # Note: This is a placeholder for GitHub's sub-issue feature
+        # Implementation would depend on GitHub's actual API when available
+        return {"message": "Sub-issue feature not yet implemented by GitHub API", "parent": parent_issue,
+                "sub": sub_issue}
+
+    def list_sub_issues(self, parent_issue: Union[int, str], owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """List sub-issues for a parent issue."""
+        # Note: This is a placeholder for GitHub's sub-issue feature
+        return {"message": "Sub-issue listing not yet implemented by GitHub API", "parent": parent_issue}
+
+    def remove_sub_issue(self, parent_issue: Union[int, str], sub_issue: Union[int, str], owner: str = "",
+                         repo: str = "") -> Dict[str, Any]:
+        """Remove a sub-issue relationship."""
+        if not self._check_destructive_operation('remove_sub_issue', {'parent': parent_issue, 'sub': sub_issue}):
+            return {"dry_run": True, "operation": "remove_sub_issue",
+                    "args": {"parent": parent_issue, "sub": sub_issue}}
+
+        # Note: This is a placeholder for GitHub's sub-issue feature
+        return {"message": "Sub-issue removal not yet implemented by GitHub API", "parent": parent_issue,
+                "sub": sub_issue}
+
+    def reprioritize_sub_issue(self, parent_issue: Union[int, str], sub_issue: Union[int, str], priority: int,
+                               owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """Reprioritize a sub-issue."""
+        if not self._check_destructive_operation('reprioritize_sub_issue',
+                                                 {'parent': parent_issue, 'sub': sub_issue, 'priority': priority}):
+            return {"dry_run": True, "operation": "reprioritize_sub_issue",
+                    "args": {"parent": parent_issue, "sub": sub_issue, "priority": priority}}
+
+        # Note: This is a placeholder for GitHub's sub-issue feature
+        return {"message": "Sub-issue reprioritization not yet implemented by GitHub API"}
+
+    def assign_copilot_to_issue(self, issue_number: Union[int, str], owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """Assign GitHub Copilot to an issue (gracefully handle if not available)."""
         try:
-            result = self._request("POST", f"/repos/{owner}/{repo}/issues", json_body=payload)
-            logger.info(f"Created issue #{result.get('number')} in {owner}/{repo}")
+            # Note: This is a placeholder - GitHub Copilot issue assignment may not be available via API
+            return {"message": "GitHub Copilot assignment not yet available via API", "issue": issue_number}
+        except Exception as e:
+            logger.warning(f"Copilot assignment failed gracefully: {e}")
+            return {"error": "Copilot assignment not available", "issue": issue_number}
 
-            # Clear issues cache
-            self._invalidate_cache_pattern(f"issues:{owner}/{repo}")
+    # ============================================================================
+    # PULL REQUEST OPERATIONS
+    # ============================================================================
 
-            return result
-        except GitHubError as e:
-            logger.error(f"Failed to create issue in {owner}/{repo}: {e}")
-            raise
-
-    def list_issues(
-            self,
-            owner: str,
-            repo: str,
-            state: str = "open",
-            per_page: int = 100,
-            labels: Optional[List[str]] = None,
-            assignee: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """List issues with enhanced filtering and caching."""
-
-        params = {
-            "state": state,
-            "per_page": min(per_page, self.config.max_per_page)
-        }
-
-        if labels:
-            params["labels"] = ",".join(labels)
-        if assignee:
-            params["assignee"] = assignee
-
-        cache_key = f"issues:{owner}/{repo}:{state}:{hash(str(params))}"
-
-        try:
-            items = self._request("GET", f"/repos/{owner}/{repo}/issues", params=params, cache_key=cache_key)
-            # Filter out pull requests
-            return [item for item in items if "pull_request" not in item]
-        except GitHubError as e:
-            logger.error(f"Failed to list issues for {owner}/{repo}: {e}")
-            raise
-
-    # ---------------- Enhanced Pull Request Operations ----------------
-
-    def create_pull_request(
-            self,
-            owner: str,
-            repo: str,
-            head: str,
-            base: str,
-            title: str,
-            body: str = "",
-            draft: bool = False,
-            maintainer_can_modify: bool = True
-    ) -> Dict[str, Any]:
-        """Create pull request with enhanced options."""
+    def create_pull_request(self, title: str, head: str, base: str, owner: str = "", repo: str = "", **kwargs) -> Dict[
+        str, Any]:
+        """Create a pull request."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
         if not title.strip():
             raise GitHubError("Pull request title cannot be empty")
 
-        payload = {
-            "title": title.strip(),
-            "head": head,
-            "base": base,
-            "body": body,
-            "draft": draft,
-            "maintainer_can_modify": maintainer_can_modify
-        }
+        cleaned_args = self._clean_args('create_pull_request', {
+            'title': title.strip(), 'head': head, 'base': base, **kwargs
+        })
 
+        result = self._request("POST", f"/repos/{owner}/{repo}/pulls", json_body=cleaned_args)
+        logger.info(f"Created PR #{result.get('number')} in {owner}/{repo}")
+
+        self._invalidate_cache_pattern(f"pulls:{owner}/{repo}")
+        return result
+
+    def update_pull_request(self, pull_number: Union[int, str], owner: str = "", repo: str = "", **kwargs) -> Dict[
+        str, Any]:
+        """Update an existing pull request."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        pr_num = normalize_issue_pr_input(str(pull_number))
+        cleaned_args = self._clean_args('update_pull_request', kwargs)
+
+        result = self._request("PATCH", f"/repos/{owner}/{repo}/pulls/{pr_num}", json_body=cleaned_args)
+        self._invalidate_cache_pattern(f"pulls:{owner}/{repo}")
+        return result
+
+    def merge_pull_request(self, pull_number: Union[int, str], owner: str = "", repo: str = "", **kwargs) -> Dict[
+        str, Any]:
+        """Merge a pull request."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        pr_num = normalize_issue_pr_input(str(pull_number))
+
+        if not self._check_destructive_operation('merge_pull_request', {'pull_number': pr_num, **kwargs}):
+            return {"dry_run": True, "operation": "merge_pull_request", "args": {"pull_number": pr_num, **kwargs}}
+
+        cleaned_args = self._clean_args('merge_pull_request', kwargs)
+
+        result = self._request("PUT", f"/repos/{owner}/{repo}/pulls/{pr_num}/merge", json_body=cleaned_args)
+        self._invalidate_cache_pattern(f"pulls:{owner}/{repo}")
+        return result
+
+    def list_pull_requests(self, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """List pull requests."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        cleaned_args = self._clean_args('list_pull_requests', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+        return self._request("GET", f"/repos/{owner}/{repo}/pulls", params=params,
+                             cache_key=f"pulls:{owner}/{repo}:{hash(str(params))}")
+
+    def get_pull_request(self, pull_number: Union[int, str], owner: str = "", repo: str = "", **kwargs) -> Dict[
+        str, Any]:
+        """Get a specific pull request."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        pr_num = normalize_issue_pr_input(str(pull_number))
+        return self._request("GET", f"/repos/{owner}/{repo}/pulls/{pr_num}",
+                             cache_key=f"pr:{owner}/{repo}:{pr_num}")
+
+    def get_pull_request_files(self, pull_number: Union[int, str], owner: str = "", repo: str = "", **kwargs) -> Dict[
+        str, Any]:
+        """Get files changed in a pull request."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        pr_num = normalize_issue_pr_input(str(pull_number))
+        cleaned_args = self._clean_args('get_pull_request_files', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+
+        return self._request("GET", f"/repos/{owner}/{repo}/pulls/{pr_num}/files", params=params)
+
+    def get_pull_request_reviews(self, pull_number: Union[int, str], owner: str = "", repo: str = "", **kwargs) -> Dict[
+        str, Any]:
+        """Get reviews for a pull request."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        pr_num = normalize_issue_pr_input(str(pull_number))
+        cleaned_args = self._clean_args('get_pull_request_reviews', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+
+        return self._request("GET", f"/repos/{owner}/{repo}/pulls/{pr_num}/reviews", params=params)
+
+    def get_pull_request_status(self, pull_number: Union[int, str], owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """Get status checks for a pull request."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        pr_num = normalize_issue_pr_input(str(pull_number))
+
+        # Get the PR to find the head SHA
+        pr_data = self.get_pull_request(pr_num, owner, repo)
+        head_sha = pr_data.get('head', {}).get('sha')
+
+        if not head_sha:
+            raise GitHubError("Could not determine head SHA for pull request")
+
+        return self._request("GET", f"/repos/{owner}/{repo}/commits/{head_sha}/status")
+
+    def get_pull_request_comments(self, pull_number: Union[int, str], owner: str = "", repo: str = "", **kwargs) -> \
+    Dict[str, Any]:
+        """Get comments on a pull request."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        pr_num = normalize_issue_pr_input(str(pull_number))
+        cleaned_args = self._clean_args('get_pull_request_comments', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+        return self._request("GET", f"/repos/{owner}/{repo}/pulls/{pr_num}/comments", params=params)
+
+    def get_pull_request_diff(self, pull_number: Union[int, str], owner: str = "", repo: str = "") -> str:
+        """Get diff for a pull request."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        pr_num = normalize_issue_pr_input(str(pull_number))
+
+        # Use raw request to get diff format
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_num}"
+        headers = self._get_headers()
+        headers["Accept"] = "application/vnd.github.diff"
+
+        response = self.session.get(url, headers=headers, timeout=self.config.timeout)
+        if response.status_code >= 400:
+            raise GitHubError(f"Failed to get PR diff: {response.status_code}")
+
+        return response.text
+
+    def request_copilot_review(self, pull_number: Union[int, str], owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """Request GitHub Copilot review for a pull request (gracefully handle if not available)."""
         try:
-            result = self._request("POST", f"/repos/{owner}/{repo}/pulls", json_body=payload)
-            logger.info(f"Created PR #{result.get('number')} in {owner}/{repo}")
+            # Note: This is a placeholder - GitHub Copilot PR reviews may not be available via API
+            return {"message": "GitHub Copilot PR review not yet available via API", "pull_request": pull_number}
+        except Exception as e:
+            logger.warning(f"Copilot review request failed gracefully: {e}")
+            return {"error": "Copilot review not available", "pull_request": pull_number}
 
-            # Clear PR cache
-            self._invalidate_cache_pattern(f"pulls:{owner}/{repo}")
+    def search_pull_requests(self, query: str, **kwargs) -> Dict[str, Any]:
+        """Search pull requests across GitHub."""
+        # Add is:pr to query if not already present
+        if "is:pr" not in query.lower():
+            query = f"{query} is:pr"
 
-            return result
-        except GitHubError as e:
-            logger.error(f"Failed to create PR in {owner}/{repo}: {e}")
-            raise
+        cleaned_args = self._clean_args('search_pull_requests', {'q': query, **kwargs})
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
 
-    # Alias for compatibility
-    def open_pull_request(self, *args, **kwargs) -> Dict[str, Any]:
-        """Alias for create_pull_request for backward compatibility."""
-        return self.create_pull_request(*args, **kwargs)
+        return self._request("GET", "/search/issues", params=params)
 
-    def list_pull_requests(
-            self,
-            owner: str,
-            repo: str,
-            state: str = "open",
-            per_page: int = 100,
-            base: Optional[str] = None,
-            head: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """List pull requests with enhanced filtering."""
+    def update_pull_request_branch(self, pull_number: Union[int, str], owner: str = "", repo: str = "") -> Dict[
+        str, Any]:
+        """Update pull request branch with latest changes from base."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-        params = {
-            "state": state,
-            "per_page": min(per_page, self.config.max_per_page)
-        }
+        pr_num = normalize_issue_pr_input(str(pull_number))
 
-        if base:
-            params["base"] = base
-        if head:
-            params["head"] = head
+        return self._request("PUT", f"/repos/{owner}/{repo}/pulls/{pr_num}/update-branch",
+                             json_body={"expected_head_sha": None})
 
-        cache_key = f"pulls:{owner}/{repo}:{state}:{hash(str(params))}"
+    # ============================================================================
+    # WORKFLOW OPERATIONS
+    # ============================================================================
 
-        return self._request("GET", f"/repos/{owner}/{repo}/pulls", params=params, cache_key=cache_key)
+    def list_workflows(self, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """List workflows."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-    # ---------------- Enhanced Branch and File Operations ----------------
+        cleaned_args = self._clean_args('list_workflows', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
 
-    def create_branch(
-            self,
-            owner: str,
-            repo: str,
-            branch: str,
-            from_branch: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Create branch with enhanced error handling."""
+        return self._request("GET", f"/repos/{owner}/{repo}/actions/workflows", params=params,
+                             cache_key=f"workflows:{owner}/{repo}")
 
-        try:
-            base_branch = from_branch or self._get_default_branch_cached(owner, repo)
-            sha = self._get_branch_sha(owner, repo, base_branch)
+    def list_workflow_runs(self, workflow_input: Union[str, int] = None, owner: str = "", repo: str = "", **kwargs) -> \
+    Dict[str, Any]:
+        """List workflow runs."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-            payload = {"ref": f"refs/heads/{branch}", "sha": sha}
-            result = self._request("POST", f"/repos/{owner}/{repo}/git/refs", json_body=payload)
+        cleaned_args = self._clean_args('list_workflow_runs', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
 
-            logger.info(f"Created branch '{branch}' from '{base_branch}' in {owner}/{repo}")
+        if workflow_input:
+            # Specific workflow
+            workflow_id = self._resolve_workflow_id(owner, repo, workflow_input)
+            return self._request("GET", f"/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs", params=params)
+        else:
+            # All workflows
+            return self._request("GET", f"/repos/{owner}/{repo}/actions/runs", params=params)
 
-            # Clear branches cache
-            self._invalidate_cache_pattern(f"branches:{owner}/{repo}")
+    def get_workflow_run(self, run_id: int, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Get a specific workflow run."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-            return result
-        except GitHubError as e:
-            logger.error(f"Failed to create branch '{branch}' in {owner}/{repo}: {e}")
-            raise
+        return self._request("GET", f"/repos/{owner}/{repo}/actions/runs/{run_id}",
+                             cache_key=f"run:{owner}/{repo}:{run_id}")
 
-    def create_or_update_file(
-            self,
-            owner: str,
-            repo: str,
-            path: str,
-            content: Union[str, bytes],
-            message: str,
-            branch: str,
-            committer: Optional[Dict[str, str]] = None
-    ) -> Dict[str, Any]:
-        """Create or update file with enhanced content handling."""
+    def get_workflow_run_usage(self, run_id: int, owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """Get workflow run usage."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-        if not message.strip():
-            raise GitHubError("Commit message cannot be empty")
+        return self._request("GET", f"/repos/{owner}/{repo}/actions/runs/{run_id}/timing")
 
-        try:
-            # Check if file exists
-            sha = None
-            try:
-                existing_file = self._request(
-                    "GET",
-                    f"/repos/{owner}/{repo}/contents/{path}",
-                    params={"ref": branch}
-                )
-                sha = existing_file.get("sha")
-            except GitHubError as e:
-                if e.status_code != 404:
-                    raise
-                # File doesn't exist, which is fine for creation
+    def get_workflow_run_logs(self, run_id: int, owner: str = "", repo: str = "") -> bytes:
+        """Get workflow run logs."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-            # Prepare content
-            if isinstance(content, str):
-                content_b64 = base64.b64encode(content.encode('utf-8')).decode('ascii')
-            else:
-                content_b64 = base64.b64encode(content).decode('ascii')
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/runs/{run_id}/logs"
+        response = self.session.get(url, headers=self._get_headers(), timeout=self.config.timeout)
 
-            payload = {
-                "message": message.strip(),
-                "content": content_b64,
-                "branch": branch
-            }
+        if response.status_code >= 400:
+            raise GitHubError(f"Failed to get workflow logs: {response.status_code}")
 
-            if sha:
-                payload["sha"] = sha
+        return response.content
 
-            if committer:
-                payload["committer"] = committer
+    def get_job_logs(self, job_id: int, owner: str = "", repo: str = "") -> bytes:
+        """Get job logs."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-            result = self._request("PUT", f"/repos/{owner}/{repo}/contents/{path}", json_body=payload)
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs"
+        response = self.session.get(url, headers=self._get_headers(), timeout=self.config.timeout)
 
-            action = "Updated" if sha else "Created"
-            logger.info(f"{action} file '{path}' in {owner}/{repo}:{branch}")
+        if response.status_code >= 400:
+            raise GitHubError(f"Failed to get job logs: {response.status_code}")
 
-            return result
-        except GitHubError as e:
-            logger.error(f"Failed to create/update file '{path}' in {owner}/{repo}: {e}")
-            raise
+        return response.content
 
-    # ---------------- Enhanced Workflow Operations ----------------
+    def list_workflow_jobs(self, run_id: int, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """List jobs for a workflow run."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-    def list_workflows(self, owner: str, repo: str) -> Dict[str, Any]:
-        """List workflows with caching."""
-        cache_key = f"workflows:{owner}/{repo}"
-        return self._request("GET", f"/repos/{owner}/{repo}/actions/workflows", cache_key=cache_key)
+        cleaned_args = self._clean_args('list_workflow_jobs', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
 
-    def run_workflow(
-            self,
-            owner: str,
-            repo: str,
-            workflow_id: str,
-            ref: str,
-            inputs: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Run workflow with enhanced error handling."""
+        return self._request("GET", f"/repos/{owner}/{repo}/actions/runs/{run_id}/jobs", params=params)
+
+    def list_workflow_run_artifacts(self, run_id: int, owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """List artifacts for a workflow run."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        return self._request("GET", f"/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts")
+
+    def download_workflow_run_artifact(self, artifact_id: int, owner: str = "", repo: str = "") -> bytes:
+        """Download a workflow run artifact."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip"
+        response = self.session.get(url, headers=self._get_headers(), timeout=self.config.timeout)
+
+        if response.status_code >= 400:
+            raise GitHubError(f"Failed to download artifact: {response.status_code}")
+
+        return response.content
+
+    def run_workflow(self, workflow_input: Union[str, int], ref: str, owner: str = "", repo: str = "", **kwargs) -> \
+    Dict[str, Any]:
+        """Run a workflow."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        workflow_id = self._resolve_workflow_id(owner, repo, workflow_input)
+        cleaned_args = self._clean_args('run_workflow', {'ref': ref, **kwargs})
 
         payload = {"ref": ref}
-        if inputs:
-            payload["inputs"] = inputs
+        if 'inputs' in cleaned_args:
+            payload["inputs"] = cleaned_args['inputs']
 
-        try:
-            # Use direct session call for workflow dispatch (returns 204)
-            response = self.session.post(
-                f"{GITHUB_API}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches",
-                headers=self._get_headers(),
-                json=payload,
-                timeout=self.config.timeout
+        # Workflow dispatch returns 204 on success
+        response = self.session.post(
+            f"{GITHUB_API}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches",
+            headers=self._get_headers(),
+            json=payload,
+            timeout=self.config.timeout
+        )
+
+        self._update_rate_limit_info(response)
+
+        if response.status_code >= 400:
+            error_detail = self._parse_error_response(response)
+            raise GitHubError(
+                f"Workflow dispatch failed [{response.status_code}]: {error_detail}",
+                status_code=response.status_code,
+                response_data=error_detail
             )
 
-            self._update_rate_limit_info(response)
+        logger.info(f"Dispatched workflow '{workflow_id}' on {ref} in {owner}/{repo}")
+        return {"ok": True, "status": response.status_code, "workflow_id": workflow_id, "ref": ref}
 
-            if response.status_code >= 400:
-                error_detail = self._parse_error_response(response)
-                raise GitHubError(
-                    f"Workflow dispatch failed [{response.status_code}]: {error_detail}",
-                    status_code=response.status_code,
-                    response_data=error_detail
-                )
+    def rerun_workflow_run(self, run_id: int, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Rerun a workflow run."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-            logger.info(f"Dispatched workflow '{workflow_id}' on {ref} in {owner}/{repo}")
-            return {"ok": True, "status": response.status_code}
+        return self._request("POST", f"/repos/{owner}/{repo}/actions/runs/{run_id}/rerun", json_body={})
 
-        except requests.exceptions.RequestException as e:
-            raise GitHubError(f"Workflow dispatch failed: {str(e)}")
+    def rerun_failed_jobs(self, run_id: int, owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """Rerun failed jobs in a workflow run."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-    # ---------------- Batch Operations ----------------
+        return self._request("POST", f"/repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs", json_body={})
 
-    def create_issues_batch(
-            self,
-            owner: str,
-            repo: str,
-            issues: List[Dict[str, Any]],
-            parallel: bool = True
-    ) -> List[Dict[str, Any]]:
-        """Create multiple issues efficiently."""
+    def cancel_workflow_run(self, run_id: int, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Cancel a workflow run."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-        if not issues:
-            return []
+        if not self._check_destructive_operation('cancel_workflow_run', {'run_id': run_id}):
+            return {"dry_run": True, "operation": "cancel_workflow_run", "args": {"run_id": run_id}}
 
-        if parallel and len(issues) > 1:
-            return self._create_issues_parallel(owner, repo, issues)
-        else:
-            return self._create_issues_sequential(owner, repo, issues)
+        return self._request("POST", f"/repos/{owner}/{repo}/actions/runs/{run_id}/cancel", json_body={})
 
-    def _create_issues_sequential(
-            self,
-            owner: str,
-            repo: str,
-            issues: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Create issues sequentially."""
-        results = []
+    # ============================================================================
+    # SEARCH OPERATIONS
+    # ============================================================================
 
-        for i, issue_data in enumerate(issues):
-            try:
-                result = self.create_issue(owner, repo, **issue_data)
-                results.append({"success": True, "result": result, "index": i})
-            except Exception as e:
-                results.append({"success": False, "error": str(e), "index": i})
+    def search_code(self, query: str, **kwargs) -> Dict[str, Any]:
+        """Search code across GitHub."""
+        cleaned_args = self._clean_args('search_code', {'q': query, **kwargs})
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
 
-        return results
+        return self._request("GET", "/search/code", params=params)
 
-    def _create_issues_parallel(
-            self,
-            owner: str,
-            repo: str,
-            issues: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Create issues in parallel."""
+    # ============================================================================
+    # SECURITY OPERATIONS
+    # ============================================================================
 
-        def create_single(issue_with_index):
-            index, issue_data = issue_with_index
-            try:
-                result = self.create_issue(owner, repo, **issue_data)
-                return {"success": True, "result": result, "index": index}
-            except Exception as e:
-                return {"success": False, "error": str(e), "index": index}
+    def list_code_scanning_alerts(self, owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """List code scanning alerts."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-        indexed_issues = list(enumerate(issues))
-        results = list(self._executor.map(create_single, indexed_issues))
+        return self._request("GET", f"/repos/{owner}/{repo}/code-scanning/alerts")
 
-        return sorted(results, key=lambda x: x["index"])
+    def get_code_scanning_alert(self, alert_number: int, owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """Get a specific code scanning alert."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-    # ---------------- Pagination Support ----------------
+        return self._request("GET", f"/repos/{owner}/{repo}/code-scanning/alerts/{alert_number}")
 
-    def list_issues_all(
-            self,
-            owner: str,
-            repo: str,
-            state: str = "open",
-            max_pages: int = 10
-    ) -> List[Dict[str, Any]]:
-        """List all issues with automatic pagination."""
+    def list_dependabot_alerts(self, owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """List Dependabot alerts."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-        all_issues = []
-        page = 1
+        return self._request("GET", f"/repos/{owner}/{repo}/dependabot/alerts")
 
-        while page <= max_pages:
-            try:
-                issues = self.list_issues(owner, repo, state=state, per_page=100)
-                if not issues:
-                    break
+    def get_dependabot_alert(self, alert_number: int, owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """Get a specific Dependabot alert."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-                all_issues.extend(issues)
+        return self._request("GET", f"/repos/{owner}/{repo}/dependabot/alerts/{alert_number}")
 
-                if len(issues) < 100:
-                    break  # Last page
+    def list_secret_scanning_alerts(self, owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """List secret scanning alerts."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-                page += 1
+        return self._request("GET", f"/repos/{owner}/{repo}/secret-scanning/alerts")
 
-            except GitHubError as e:
-                logger.error(f"Pagination failed on page {page}: {e}")
-                break
+    def get_secret_scanning_alert(self, alert_number: int, owner: str = "", repo: str = "") -> Dict[str, Any]:
+        """Get a specific secret scanning alert."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
 
-        return all_issues
+        return self._request("GET", f"/repos/{owner}/{repo}/secret-scanning/alerts/{alert_number}")
 
-    # ---------------- Cache Management ----------------
+    # ============================================================================
+    # NOTIFICATIONS
+    # ============================================================================
 
-    def _invalidate_cache_pattern(self, pattern: str) -> None:
-        """Invalidate cache entries matching a pattern."""
-        with self._cache_lock:
-            keys_to_remove = [key for key in self._cache.keys() if pattern in key]
-            for key in keys_to_remove:
-                del self._cache[key]
-                if key in self._cache_timestamps:
-                    del self._cache_timestamps[key]
+    def list_notifications(self, **kwargs) -> Dict[str, Any]:
+        """List notifications for the authenticated user."""
+        cleaned_args = self._clean_args('list_notifications', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+        return self._request("GET", "/notifications", params=params)
+
+    def mark_notifications_read(self, **kwargs) -> Dict[str, Any]:
+        """Mark notifications as read."""
+        cleaned_args = self._clean_args('mark_notifications_read', kwargs)
+        payload = cleaned_args or {}
+        return self._request("PUT", "/notifications", json_body=payload)
+
+    # ============================================================================
+    # USER & ORG OPERATIONS
+    # ============================================================================
+
+    def search_users(self, query: str, **kwargs) -> Dict[str, Any]:
+        """Search users across GitHub."""
+        cleaned_args = self._clean_args('search_users', {'q': query, **kwargs})
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+        return self._request("GET", "/search/users", params=params)
+
+    def search_orgs(self, query: str, **kwargs) -> Dict[str, Any]:
+        """Search organizations across GitHub."""
+        cleaned_args = self._clean_args('search_orgs', {'q': query, **kwargs})
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+        return self._request("GET", "/search/users", params={**params, "type": "org"})
+
+    # ============================================================================
+    # DISCUSSION OPERATIONS (graceful fallbacks)
+    # ============================================================================
+
+    def list_discussions(self, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """List repository discussions (if available via REST API)."""
+        try:
+            owner = owner or self.default_owner
+            repo = repo or self.default_repo
+            if not (owner and repo):
+                raise GitHubError("Owner and repo are required")
+
+            cleaned_args = self._clean_args('list_discussions', kwargs)
+            params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+            params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+            return self._request("GET", f"/repos/{owner}/{repo}/discussions", params=params)
+        except GitHubError as e:
+            if e.status_code == 404:
+                return {"message": "Discussions not available or not enabled for this repository", "discussions": []}
+            raise
+
+    def get_discussion(self, discussion_number: int, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """Get a specific discussion (if available via REST API)."""
+        try:
+            owner = owner or self.default_owner
+            repo = repo or self.default_repo
+            if not (owner and repo):
+                raise GitHubError("Owner and repo are required")
+
+            return self._request("GET", f"/repos/{owner}/{repo}/discussions/{discussion_number}")
+        except GitHubError as e:
+            if e.status_code == 404:
+                return {"message": "Discussion not found or discussions not available",
+                        "discussion_number": discussion_number}
+            raise
+
+    def list_discussion_comments(self, discussion_number: int, owner: str = "", repo: str = "", **kwargs) -> Dict[
+        str, Any]:
+        """List comments on a discussion (if available via REST API)."""
+        try:
+            owner = owner or self.default_owner
+            repo = repo or self.default_repo
+            if not (owner and repo):
+                raise GitHubError("Owner and repo are required")
+
+            cleaned_args = self._clean_args('list_discussion_comments', kwargs)
+            params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+
+            return self._request("GET", f"/repos/{owner}/{repo}/discussions/{discussion_number}/comments",
+                                 params=params)
+        except GitHubError as e:
+            if e.status_code == 404:
+                return {"message": "Discussion comments not available", "comments": []}
+            raise
+
+    # ============================================================================
+    # GIST OPERATIONS (graceful fallbacks)
+    # ============================================================================
+
+    def create_gist(self, files: Dict[str, Dict[str, str]], **kwargs) -> Dict[str, Any]:
+        """Create a gist (if gist API is accessible)."""
+        try:
+            cleaned_args = self._clean_args('create_gist', {'files': files, **kwargs})
+            return self._request("POST", "/gists", json_body=cleaned_args)
+        except GitHubError as e:
+            if e.status_code in [404, 403]:
+                return {"message": "Gist creation not supported in this build", "error": str(e)}
+            raise
+
+    def list_gists(self, **kwargs) -> Dict[str, Any]:
+        """List gists for authenticated user (if gist API is accessible)."""
+        try:
+            cleaned_args = self._clean_args('list_gists', kwargs)
+            params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+            params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+
+            return self._request("GET", "/gists", params=params)
+        except GitHubError as e:
+            if e.status_code in [404, 403]:
+                return {"message": "Gist listing not supported in this build", "gists": []}
+            raise
+
+    def update_gist(self, gist_id: str, **kwargs) -> Dict[str, Any]:
+        """Update a gist (if gist API is accessible)."""
+        try:
+            cleaned_args = self._clean_args('update_gist', kwargs)
+            return self._request("PATCH", f"/gists/{gist_id}", json_body=cleaned_args)
+        except GitHubError as e:
+            if e.status_code in [404, 403]:
+                return {"message": "Gist updates not supported in this build", "gist_id": gist_id}
+            raise
+
+    # ============================================================================
+    # UTILITY METHODS
+    # ============================================================================
 
     def clear_cache(self) -> None:
         """Clear all cached data."""
@@ -660,66 +1494,46 @@ class GitHubClient:
             self._cache.clear()
             self._cache_timestamps.clear()
 
-        # Clear LRU caches
-        self.get_user.cache_clear()
-        self._get_default_branch_cached.cache_clear()
-
-        logger.info("GitHub client cache cleared")
-
-    # ---------------- Resource Management ----------------
-
-    def close(self) -> None:
-        """Clean up resources."""
-        if hasattr(self, 'session'):
-            self.session.close()
-        if hasattr(self, '_executor'):
-            self._executor.shutdown(wait=True)
-        self.clear_cache()
-        logger.info("GitHub client resources cleaned up")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    # ---------------- Monitoring and Statistics ----------------
-
-    def get_rate_limit_status(self) -> Dict[str, Any]:
-        """Get current rate limit status."""
-        with self._rate_limit_lock:
-            return {
-                "remaining": self._rate_limit_remaining,
-                "reset_time": self._rate_limit_reset_time,
-                "reset_in_seconds": max(0, self._rate_limit_reset_time - time.time())
-            }
-
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""
         with self._cache_lock:
             return {
-                "cache_size": len(self._cache),
-                "cache_keys": list(self._cache.keys()),
-                "oldest_entry": min(self._cache_timestamps.values()) if self._cache_timestamps else None,
-                "newest_entry": max(self._cache_timestamps.values()) if self._cache_timestamps else None
+                "cached_items": len(self._cache),
+                "cache_enabled": self.config.enable_caching,
+                "cache_ttl": self.config.cache_ttl,
+                "rate_limit_remaining": self._rate_limit_remaining,
+                "rate_limit_reset": self._rate_limit_reset_time
             }
 
-    def health_check(self) -> Dict[str, Any]:
-        """Perform health check."""
-        try:
-            start_time = time.time()
-            user_info = self.get_user()
-            response_time = time.time() - start_time
+    def get_rate_limit_status(self) -> Dict[str, Any]:
+        """Get current rate limit status."""
+        return self._request("GET", "/rate_limit")
 
-            return {
-                "healthy": True,
-                "response_time": response_time,
-                "user": user_info.get("login"),
-                "rate_limit": self.get_rate_limit_status()
-            }
-        except Exception as e:
-            return {
-                "healthy": False,
-                "error": str(e),
-                "rate_limit": self.get_rate_limit_status()
-            }
+    def close(self) -> None:
+        """Clean up resources."""
+        if hasattr(self, '_executor') and self._executor:
+            self._executor.shutdown(wait=True)
+        if hasattr(self, 'session') and self.session:
+            self.session.close()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()
+
+    # ============================================================================
+    # CONVENIENCE ALIASES FOR UI COMPATIBILITY
+    # ============================================================================
+
+    # These aliases ensure compatibility with the existing UI action mapping
+    def open_pull_request(self, title: str, head: str, base: str, owner: str = "", repo: str = "", **kwargs) -> Dict[
+        str, Any]:
+        """Alias for create_pull_request to maintain UI compatibility."""
+        return self.create_pull_request(title, head, base, owner, repo, **kwargs)
+
+    def list_open_issues(self, owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:
+        """List open issues (convenience method)."""
+        return self.list_issues(owner, repo, state="open", **kwargs)

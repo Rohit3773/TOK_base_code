@@ -16,10 +16,26 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 # ---- Lazy imports for better startup performance ----
+_github_client = None
 _jira_client = None
 _notion_client = None
 _llm_agent = None
 _graph_agent = None
+
+
+def get_github_modules():
+    global _github_client
+    if _github_client is None:
+        try:
+            from github_client import GitHubClient, GitHubError
+            _github_client = (GitHubClient, GitHubError)
+        except ImportError:
+            try:
+                from clients.github_client import GitHubClient, GitHubError
+                _github_client = (GitHubClient, GitHubError)
+            except ImportError:
+                raise ImportError("GitHub client not available")
+    return _github_client
 
 
 def get_jira_modules():
@@ -109,6 +125,7 @@ SESSION: Dict[str, Optional[str]] = {
 }
 
 # Connection pools for clients
+_github_clients: Dict[str, Any] = {}
 _jira_clients: Dict[str, Any] = {}
 _notion_clients: Dict[str, Any] = {}
 
@@ -117,6 +134,32 @@ _notion_clients: Dict[str, Any] = {}
 def _get(key: str, override: Optional[str] = None) -> Optional[str]:
     """Cached secret resolution with priority: explicit override -> session -> env."""
     return override or SESSION.get(key) or os.getenv(key)
+
+
+def _get_github_cached(
+        token_override: Optional[str] = None,
+        owner: Optional[str] = None,
+        repo: Optional[str] = None,
+) -> Any:
+    """Get or create cached GitHub client for better performance."""
+    GitHubClient, GitHubError = get_github_modules()
+
+    token = _get("GITHUB_TOKEN", token_override)
+
+    if not token:
+        raise Exception("Missing GitHub token")
+
+    # Create cache key
+    cache_key = f"github:{hash(token)}:{owner or ''}:{repo or ''}"
+
+    if cache_key not in _github_clients:
+        _github_clients[cache_key] = GitHubClient(
+            token=token,
+            default_owner=owner or "",
+            default_repo=repo or ""
+        )
+
+    return _github_clients[cache_key]
 
 
 def _get_jira_cached(
@@ -168,6 +211,12 @@ def _get_notion_cached(token_override: Optional[str] = None) -> Any:
 def health() -> str:
     """Fast health check with capability detection."""
     try:
+        get_github_modules()
+        github_available = True
+    except ImportError:
+        github_available = False
+
+    try:
         get_jira_modules()
         jira_available = True
     except ImportError:
@@ -189,6 +238,27 @@ def health() -> str:
     graph_available = plan_lc is not None and run_lg is not None
 
     tools = []
+
+    # GitHub tools
+    if github_available:
+        tools.extend([
+            "gh_create_issue", "gh_update_issue", "gh_get_issue", "gh_list_issues", "gh_search_issues",
+            "gh_add_issue_comment",
+            "gh_create_pull_request", "gh_update_pull_request", "gh_merge_pull_request", "gh_list_pull_requests",
+            "gh_get_pull_request", "gh_get_pull_request_files", "gh_get_pull_request_reviews",
+            "gh_get_pull_request_status",
+            "gh_get_pull_request_comments", "gh_get_pull_request_diff", "gh_update_pull_request_branch",
+            "gh_search_pull_requests",
+            "gh_create_branch", "gh_list_branches", "gh_list_commits", "gh_get_commit", "gh_get_file_contents",
+            "gh_create_or_update_file", "gh_delete_file", "gh_push_files", "gh_list_tags", "gh_get_tag",
+            "gh_list_releases", "gh_get_latest_release", "gh_get_release_by_tag",
+            "gh_list_workflows", "gh_list_workflow_runs", "gh_get_workflow_run", "gh_get_workflow_run_usage",
+            "gh_get_workflow_run_logs", "gh_get_job_logs", "gh_list_workflow_jobs", "gh_list_workflow_run_artifacts",
+            "gh_download_workflow_run_artifact", "gh_run_workflow", "gh_rerun_workflow_run", "gh_rerun_failed_jobs",
+            "gh_cancel_workflow_run", "gh_search_code", "gh_list_code_scanning_alerts", "gh_get_code_scanning_alert",
+            "gh_list_dependabot_alerts", "gh_get_dependabot_alert", "gh_list_secret_scanning_alerts",
+            "gh_get_secret_scanning_alert"
+        ])
 
     # Jira tools
     if jira_available:
@@ -212,12 +282,13 @@ def health() -> str:
         "ok": True,
         "performance_optimizations": [
             "Lazy imports for faster startup",
-            "Connection pooling for Jira and Notion clients",
+            "Connection pooling for GitHub, Jira and Notion clients",
             "LRU cache for credential resolution",
             "Thread pool for I/O operations",
             "Batch operation support"
         ],
         "capabilities": {
+            "github": github_available,
             "jira": jira_available,
             "notion": notion_available,
             "llm_planning": llm_available,
@@ -241,6 +312,7 @@ def set_session_secrets(
     # Clear caches when credentials change
     if any([openai_api_key, openai_model, github_token, jira_base_url, jira_email, jira_api_token, notion_token]):
         _get.cache_clear()
+        _github_clients.clear()
         _jira_clients.clear()
         _notion_clients.clear()
 
@@ -339,6 +411,7 @@ def plan_actions(
 @mcp.tool()
 def execute_plan_multi_platform(
         plan_json: str,
+        github_token: Optional[str] = None,
         jira_base_url: Optional[str] = None,
         jira_email: Optional[str] = None,
         jira_api_token: Optional[str] = None,
@@ -347,8 +420,7 @@ def execute_plan_multi_platform(
 ) -> str:
     """
     Execute multi-platform actions with optional parallel processing.
-    GitHub steps are deferred to official GitHub MCP server.
-    Supports Jira and Notion execution.
+    Supports GitHub, Jira, and Notion execution.
     """
     try:
         plan = json.loads(plan_json)
@@ -360,29 +432,33 @@ def execute_plan_multi_platform(
         return json.dumps({"ok": True, "results": []}, indent=2)
 
     results = []
+    github_actions = []
     jira_actions = []
     notion_actions = []
 
     # Separate actions by platform
     for idx, step in enumerate(actions, start=1):
         server = (step.get("server", "") or "").lower()
+        service = (step.get("service", "") or "").lower()
         tool = step.get("tool", "")
+        action = step.get("action", "")
 
-        if server == "github":
-            results.append({
-                "step": idx,
-                "server": "github",
-                "tool": tool,
-                "ok": True,
-                "deferred": True,
-                "message": "Execute with official GitHub MCP server"
-            })
-        elif server == "jira" or tool.startswith("jira_"):
+        # Support both old and new formats
+        if server == "github" or service == "github" or tool.startswith("gh_") or action.startswith("gh_"):
+            github_actions.append((idx, step))
+        elif server == "jira" or service == "jira" or tool.startswith("jira_") or action.startswith("jira_"):
             jira_actions.append((idx, step))
-        elif server == "notion" or tool.startswith("notion_"):
+        elif server == "notion" or service == "notion" or tool.startswith("notion_") or action.startswith("notion_"):
             notion_actions.append((idx, step))
 
     # Execute platform-specific actions
+    if github_actions:
+        if parallel and len(github_actions) > 1:
+            github_results = _execute_github_parallel(github_actions, github_token)
+        else:
+            github_results = _execute_github_sequential(github_actions, github_token)
+        results.extend(github_results)
+
     if jira_actions:
         if parallel and len(jira_actions) > 1:
             jira_results = _execute_jira_parallel(jira_actions, jira_base_url, jira_email, jira_api_token)
@@ -404,12 +480,160 @@ def execute_plan_multi_platform(
         "results": results,
         "metadata": {
             "total_actions": len(actions),
+            "github_actions": len(github_actions),
             "jira_actions": len(jira_actions),
             "notion_actions": len(notion_actions),
-            "github_deferred": len(actions) - len(jira_actions) - len(notion_actions),
             "parallel_execution": parallel
         }
     }, indent=2)
+
+
+def _execute_github_sequential(actions, token):
+    """Execute GitHub actions sequentially with shared client."""
+    results = []
+    github = None
+
+    for idx, step in actions:
+        try:
+            if github is None:
+                github = _get_github_cached(token)
+
+            result = _execute_single_github_action(github, step.get("tool") or step.get("action"), step.get("args", {}))
+            results.append({
+                "step": idx,
+                "server": "github",
+                "service": "github",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": True,
+                "result": result
+            })
+
+        except Exception as e:
+            results.append({
+                "step": idx,
+                "server": "github",
+                "service": "github",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": False,
+                "error": str(e)
+            })
+
+    return results
+
+
+def _execute_github_parallel(actions, token):
+    """Execute independent GitHub actions in parallel for better performance."""
+
+    def execute_single(idx_step):
+        idx, step = idx_step
+        try:
+            github = _get_github_cached(token)
+            result = _execute_single_github_action(github, step.get("tool") or step.get("action"), step.get("args", {}))
+            return {
+                "step": idx,
+                "server": "github",
+                "service": "github",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": True,
+                "result": result
+            }
+        except Exception as e:
+            return {
+                "step": idx,
+                "server": "github",
+                "service": "github",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": False,
+                "error": str(e)
+            }
+
+    # Use ThreadPoolExecutor for parallel execution
+    with ThreadPoolExecutor(max_workers=min(4, len(actions))) as pool:
+        return list(pool.map(execute_single, actions))
+
+
+def _execute_single_github_action(github, tool, args):
+    """Execute a single GitHub action with optimized routing."""
+    # Map action names to client methods
+    action_map = {
+        # Issues
+        "create_issue": lambda: github.create_issue(**args),
+        "update_issue": lambda: github.update_issue(**args),
+        "get_issue": lambda: github.get_issue(**args),
+        "list_issues": lambda: github.list_issues(**args),
+        "search_issues": lambda: github.search_issues(**args),
+        "add_issue_comment": lambda: github.add_issue_comment(**args),
+
+        # Pull Requests
+        "create_pull_request": lambda: github.create_pull_request(**args),
+        "update_pull_request": lambda: github.update_pull_request(**args),
+        "merge_pull_request": lambda: github.merge_pull_request(**args),
+        "list_pull_requests": lambda: github.list_pull_requests(**args),
+        "get_pull_request": lambda: github.get_pull_request(**args),
+        "get_pull_request_files": lambda: github.get_pull_request_files(**args),
+        "get_pull_request_reviews": lambda: github.get_pull_request_reviews(**args),
+        "get_pull_request_status": lambda: github.get_pull_request_status(**args),
+        "get_pull_request_comments": lambda: github.get_pull_request_comments(**args),
+        "get_pull_request_diff": lambda: github.get_pull_request_diff(**args),
+        "update_pull_request_branch": lambda: github.update_pull_request_branch(**args),
+        "search_pull_requests": lambda: github.search_pull_requests(**args),
+
+        # Repository/Files
+        "create_branch": lambda: github.create_branch(**args),
+        "list_branches": lambda: github.list_branches(**args),
+        "list_commits": lambda: github.list_commits(**args),
+        "get_commit": lambda: github.get_commit(**args),
+        "get_file_contents": lambda: github.get_file_contents(**args),
+        "create_or_update_file": lambda: github.create_or_update_file(**args),
+        "delete_file": lambda: github.delete_file(**args),
+        "push_files": lambda: github.push_files(**args),
+
+        # Tags/Releases
+        "list_tags": lambda: github.list_tags(**args),
+        "get_tag": lambda: github.get_tag(**args),
+        "list_releases": lambda: github.list_releases(**args),
+        "get_latest_release": lambda: github.get_latest_release(**args),
+        "get_release_by_tag": lambda: github.get_release_by_tag(**args),
+
+        # Workflows/Actions
+        "list_workflows": lambda: github.list_workflows(**args),
+        "list_workflow_runs": lambda: github.list_workflow_runs(**args),
+        "get_workflow_run": lambda: github.get_workflow_run(**args),
+        "get_workflow_run_usage": lambda: github.get_workflow_run_usage(**args),
+        "get_workflow_run_logs": lambda: github.get_workflow_run_logs(**args),
+        "get_job_logs": lambda: github.get_job_logs(**args),
+        "list_workflow_jobs": lambda: github.list_workflow_jobs(**args),
+        "list_workflow_run_artifacts": lambda: github.list_workflow_run_artifacts(**args),
+        "download_workflow_run_artifact": lambda: github.download_workflow_run_artifact(**args),
+        "run_workflow": lambda: github.run_workflow(**args),
+        "rerun_workflow_run": lambda: github.rerun_workflow_run(**args),
+        "rerun_failed_jobs": lambda: github.rerun_failed_jobs(**args),
+        "cancel_workflow_run": lambda: github.cancel_workflow_run(**args),
+
+        # Search/Security
+        "search_code": lambda: github.search_code(**args),
+        "list_code_scanning_alerts": lambda: github.list_code_scanning_alerts(**args),
+        "get_code_scanning_alert": lambda: github.get_code_scanning_alert(**args),
+        "list_dependabot_alerts": lambda: github.list_dependabot_alerts(**args),
+        "get_dependabot_alert": lambda: github.get_dependabot_alert(**args),
+        "list_secret_scanning_alerts": lambda: github.list_secret_scanning_alerts(**args),
+        "get_secret_scanning_alert": lambda: github.get_secret_scanning_alert(**args),
+    }
+
+    # Handle both "gh_" prefixed and non-prefixed action names
+    action_name = tool
+    if action_name.startswith("gh_"):
+        action_name = action_name[3:]
+
+    action = action_map.get(action_name)
+    if not action:
+        raise ValueError(f"Unknown GitHub action: {tool}")
+
+    return action()
 
 
 def _execute_jira_sequential(actions, base_url, email, token):
@@ -422,11 +646,27 @@ def _execute_jira_sequential(actions, base_url, email, token):
             if jira is None:
                 jira = _get_jira_cached(base_url, email, token)
 
-            result = _execute_single_jira_action(jira, step.get("tool"), step.get("args", {}))
-            results.append({"step": idx, "server": "jira", "tool": step.get("tool"), "ok": True, "result": result})
+            result = _execute_single_jira_action(jira, step.get("tool") or step.get("action"), step.get("args", {}))
+            results.append({
+                "step": idx,
+                "server": "jira",
+                "service": "jira",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": True,
+                "result": result
+            })
 
         except Exception as e:
-            results.append({"step": idx, "server": "jira", "tool": step.get("tool"), "ok": False, "error": str(e)})
+            results.append({
+                "step": idx,
+                "server": "jira",
+                "service": "jira",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": False,
+                "error": str(e)
+            })
 
     return results
 
@@ -438,10 +678,26 @@ def _execute_jira_parallel(actions, base_url, email, token):
         idx, step = idx_step
         try:
             jira = _get_jira_cached(base_url, email, token)
-            result = _execute_single_jira_action(jira, step.get("tool"), step.get("args", {}))
-            return {"step": idx, "server": "jira", "tool": step.get("tool"), "ok": True, "result": result}
+            result = _execute_single_jira_action(jira, step.get("tool") or step.get("action"), step.get("args", {}))
+            return {
+                "step": idx,
+                "server": "jira",
+                "service": "jira",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": True,
+                "result": result
+            }
         except Exception as e:
-            return {"step": idx, "server": "jira", "tool": step.get("tool"), "ok": False, "error": str(e)}
+            return {
+                "step": idx,
+                "server": "jira",
+                "service": "jira",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": False,
+                "error": str(e)
+            }
 
     # Use ThreadPoolExecutor for parallel execution
     with ThreadPoolExecutor(max_workers=min(4, len(actions))) as pool:
@@ -458,11 +714,27 @@ def _execute_notion_sequential(actions, token):
             if notion is None:
                 notion = _get_notion_cached(token)
 
-            result = _execute_single_notion_action(notion, step.get("tool"), step.get("args", {}))
-            results.append({"step": idx, "server": "notion", "tool": step.get("tool"), "ok": True, "result": result})
+            result = _execute_single_notion_action(notion, step.get("tool") or step.get("action"), step.get("args", {}))
+            results.append({
+                "step": idx,
+                "server": "notion",
+                "service": "notion",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": True,
+                "result": result
+            })
 
         except Exception as e:
-            results.append({"step": idx, "server": "notion", "tool": step.get("tool"), "ok": False, "error": str(e)})
+            results.append({
+                "step": idx,
+                "server": "notion",
+                "service": "notion",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": False,
+                "error": str(e)
+            })
 
     return results
 
@@ -474,10 +746,26 @@ def _execute_notion_parallel(actions, token):
         idx, step = idx_step
         try:
             notion = _get_notion_cached(token)
-            result = _execute_single_notion_action(notion, step.get("tool"), step.get("args", {}))
-            return {"step": idx, "server": "notion", "tool": step.get("tool"), "ok": True, "result": result}
+            result = _execute_single_notion_action(notion, step.get("tool") or step.get("action"), step.get("args", {}))
+            return {
+                "step": idx,
+                "server": "notion",
+                "service": "notion",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": True,
+                "result": result
+            }
         except Exception as e:
-            return {"step": idx, "server": "notion", "tool": step.get("tool"), "ok": False, "error": str(e)}
+            return {
+                "step": idx,
+                "server": "notion",
+                "service": "notion",
+                "tool": step.get("tool") or step.get("action"),
+                "action": step.get("action") or step.get("tool"),
+                "ok": False,
+                "error": str(e)
+            }
 
     # Use ThreadPoolExecutor for parallel execution
     with ThreadPoolExecutor(max_workers=min(4, len(actions))) as pool:
@@ -487,16 +775,21 @@ def _execute_notion_parallel(actions, token):
 def _execute_single_jira_action(jira, tool, args):
     """Execute a single Jira action with optimized routing."""
     action_map = {
-        "jira_create_issue": lambda: jira.create_issue(**args),
-        "jira_add_comment": lambda: jira.add_comment(**args),
-        "jira_transition_issue": lambda: jira.transition_issue(**args),
-        "jira_search": lambda: jira.search(**args),
-        "jira_project_info": lambda: jira.project_info(**args),
-        "jira_whoami": lambda: jira.whoami(),
-        "jira_list_transitions": lambda: jira.list_transitions(**args),
+        "create_issue": lambda: jira.create_issue(**args),
+        "add_comment": lambda: jira.add_comment(**args),
+        "transition_issue": lambda: jira.transition_issue(**args),
+        "search": lambda: jira.search(**args),
+        "project_info": lambda: jira.project_info(**args),
+        "whoami": lambda: jira.whoami(),
+        "list_transitions": lambda: jira.list_transitions(**args),
     }
 
-    action = action_map.get(tool)
+    # Handle both "jira_" prefixed and non-prefixed action names
+    action_name = tool
+    if action_name.startswith("jira_"):
+        action_name = action_name[5:]
+
+    action = action_map.get(action_name)
     if not action:
         raise ValueError(f"Unknown Jira tool: {tool}")
 
@@ -506,19 +799,24 @@ def _execute_single_jira_action(jira, tool, args):
 def _execute_single_notion_action(notion, tool, args):
     """Execute a single Notion action with optimized routing."""
     action_map = {
-        "notion_create_page": lambda: notion.create_page(**args),
-        "notion_update_page": lambda: notion.update_page(**args),
-        "notion_query_database": lambda: notion.query_database(**args),
-        "notion_get_database": lambda: notion.get_database(**args),
-        "notion_get_page": lambda: notion.get_page(**args),
-        "notion_search": lambda: notion.search(**args),
-        "notion_create_database": lambda: notion.create_database(**args),
-        "notion_append_blocks": lambda: notion.append_block_children(**args),
-        "notion_get_users": lambda: notion.get_users(),
-        "notion_get_bot_info": lambda: notion.get_bot_info(),
+        "create_page": lambda: notion.create_page(**args),
+        "update_page": lambda: notion.update_page(**args),
+        "query_database": lambda: notion.query_database(**args),
+        "get_database": lambda: notion.get_database(**args),
+        "get_page": lambda: notion.get_page(**args),
+        "search": lambda: notion.search(**args),
+        "create_database": lambda: notion.create_database(**args),
+        "append_blocks": lambda: notion.append_block_children(**args),
+        "get_users": lambda: notion.get_users(),
+        "get_bot_info": lambda: notion.get_bot_info(),
     }
 
-    action = action_map.get(tool)
+    # Handle both "notion_" prefixed and non-prefixed action names
+    action_name = tool
+    if action_name.startswith("notion_"):
+        action_name = action_name[7:]
+
+    action = action_map.get(action_name)
     if not action:
         raise ValueError(f"Unknown Notion tool: {tool}")
 
@@ -574,12 +872,13 @@ def run_workflow_lg(
         approved: bool = False,
         openai_api_key: Optional[str] = None,
         model: Optional[str] = None,
+        github_token: Optional[str] = None,
         jira_base_url: Optional[str] = None,
         jira_email: Optional[str] = None,
         jira_api_token: Optional[str] = None,
         notion_token: Optional[str] = None,
 ) -> str:
-    """Run complete workflow with performance optimizations and Notion support."""
+    """Run complete workflow with performance optimizations and GitHub/Jira/Notion support."""
     _, run_workflow_graph = get_graph_agent()
     if not run_workflow_graph:
         return json.dumps({"error": "LangGraph workflow not available"}, indent=2)
@@ -600,7 +899,7 @@ def run_workflow_lg(
             jira_project_key=jira_project_key,
             notion_database_id=notion_database_id,
             approved=approved,
-            github_token=None,
+            github_token=_get("GITHUB_TOKEN", github_token),
             jira_base_url=_get("JIRA_BASE_URL", jira_base_url),
             jira_email=_get("JIRA_EMAIL", jira_email),
             jira_api_token=_get("JIRA_API_TOKEN", jira_api_token),
@@ -1015,6 +1314,7 @@ def notion_batch_create_pages(
 def get_performance_stats() -> str:
     """Get performance statistics for all clients."""
     stats = {
+        "github_connections": len(_github_clients),
         "jira_connections": len(_jira_clients),
         "notion_connections": len(_notion_clients),
         "cache_info": {
@@ -1029,6 +1329,7 @@ def get_performance_stats() -> str:
 def clear_all_caches() -> str:
     """Clear all caches and connection pools."""
     _get.cache_clear()
+    _github_clients.clear()
     _jira_clients.clear()
     _notion_clients.clear()
 
@@ -1040,6 +1341,7 @@ def clear_all_caches() -> str:
 # ------------------------------------------------------------------------------------
 def cleanup():
     """Clean up resources on shutdown."""
+    _github_clients.clear()
     _jira_clients.clear()
     _notion_clients.clear()
     _get.cache_clear()

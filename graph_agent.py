@@ -127,7 +127,7 @@ class Plan(BaseModel):
         return ordered_groups
 
 
-# Optimized system prompt with better structure
+# Expanded system prompt with comprehensive GitHub tool surface
 SYSTEM_PROMPT = """You are an intelligent task planner. Analyze the user request and return ONLY valid JSON.
 
 Schema:
@@ -145,15 +145,14 @@ Schema:
   "parallel_groups": [[0,1], [2,3]]
 }
 
-GitHub Tools (server="github"):
-- create_issue(owner, repo, title, body?, labels?, assignees?)
-- create_pull_request(owner, repo, head, base, title, body?, draft?)
-- create_branch(owner, repo, branch, from_branch?)
-- create_or_update_file(owner, repo, path, content, message, branch)
-- list_pull_requests(owner, repo, state?)
-- list_issues(owner, repo, state?)
-- list_workflows(owner, repo)
-- run_workflow(owner, repo, workflow_id, ref, inputs?)
+GitHub Tools (server="github") - Comprehensive surface:
+ISSUES: create_issue, update_issue, get_issue, list_issues, search_issues, add_issue_comment
+PULL REQUESTS: create_pull_request, update_pull_request, merge_pull_request, list_pull_requests, get_pull_request, get_pull_request_files, get_pull_request_reviews, get_pull_request_status, get_pull_request_comments, get_pull_request_diff, update_pull_request_branch, search_pull_requests
+REPOSITORY: create_branch, list_branches, list_commits, get_commit, get_file_contents, create_or_update_file, delete_file, push_files
+RELEASES: list_tags, get_tag, list_releases, get_latest_release, get_release_by_tag
+WORKFLOWS: list_workflows, list_workflow_runs, get_workflow_run, get_workflow_run_usage, get_workflow_run_logs, get_job_logs, list_workflow_jobs, list_workflow_run_artifacts, download_workflow_run_artifact, run_workflow, rerun_workflow_run, rerun_failed_jobs, cancel_workflow_run
+SEARCH/SECURITY: search_code, list_code_scanning_alerts, get_code_scanning_alert, list_dependabot_alerts, get_dependabot_alert, list_secret_scanning_alerts, get_secret_scanning_alert
+OTHER: list_notifications, mark_notifications_read, search_users, search_orgs, list_discussions, get_discussion, list_discussion_comments, create_gist, list_gists, update_gist
 
 Jira Tools (server="jira"):
 - jira_create_issue(project_key, summary, description?, issuetype_name?)
@@ -250,15 +249,22 @@ def plan_node(state: AgentState, *, openai_api_key: str, model: str) -> AgentSta
 
     state["plan"] = plan
 
-    # Intelligent approval logic
+    # Intelligent approval logic - expanded to include more GitHub operations
     write_tools = {
+        # Jira write operations
         "jira_create_issue", "jira_add_comment", "jira_transition_issue",
-        "create_issue", "create_pull_request", "create_or_update_file",
+        # GitHub write operations
+        "create_issue", "update_issue", "create_pull_request", "update_pull_request", "merge_pull_request",
+        "create_or_update_file", "delete_file", "push_files", "create_branch",
+        "run_workflow", "cancel_workflow_run", "rerun_workflow_run", "rerun_failed_jobs",
+        "update_pull_request_branch", "mark_notifications_read", "create_gist", "update_gist",
+        # Notion write operations
         "notion_create_page", "notion_update_page", "notion_create_database", "notion_append_blocks"
     }
 
     needs_approval = any(
-        action.server in ["jira", "notion"] and action.tool in write_tools
+        (action.server in ["jira", "notion"] and action.tool in write_tools) or
+        (action.server == "github" and action.tool in write_tools)
         for action in plan.actions
     )
 

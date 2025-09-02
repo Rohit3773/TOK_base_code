@@ -175,7 +175,7 @@ def initialize_clients():
     if github_token and gh_owner and gh_repo:
         try:
             config = GitHubConfig(enable_caching=True, max_retries=3, timeout=30)
-            client = GitHubClient(github_token, config)
+            client = GitHubClient(github_token, config, default_owner=gh_owner, default_repo=gh_repo)
             # Test connection
             user_info = client.get_user()
             st.session_state.github_client = client
@@ -247,18 +247,97 @@ def execute_github_action(client, tool: str, args: dict) -> dict:
             cleaned_args = {k: v for k, v in args.items() if k in valid_params}
             args = cleaned_args
 
+        elif tool == 'search_issues':
+            # Ensure query parameter is present
+            if 'query' not in args:
+                return {'error': 'GitHub search_issues requires query parameter'}
+
+        elif tool == 'search_pull_requests':
+            # Ensure query parameter is present
+            if 'query' not in args:
+                return {'error': 'GitHub search_pull_requests requires query parameter'}
+
         action_map = {
+            # Issues
             'create_issue': lambda: client.create_issue(**args),
+            'update_issue': lambda: client.update_issue(**args),
+            'get_issue': lambda: client.get_issue(**args),
             'list_issues': lambda: client.list_issues(**args),
             'list_open_issues': lambda: client.list_issues(state="open", **args),
+            'search_issues': lambda: client.search_issues(**args),
+            'add_issue_comment': lambda: client.add_issue_comment(**args),
+
+            # Pull Requests
             'create_pull_request': lambda: client.create_pull_request(**args),
             'open_pull_request': lambda: client.create_pull_request(**args),
+            'update_pull_request': lambda: client.update_pull_request(**args),
+            'merge_pull_request': lambda: client.merge_pull_request(**args),
             'list_pull_requests': lambda: client.list_pull_requests(**args),
+            'get_pull_request': lambda: client.get_pull_request(**args),
+            'get_pull_request_files': lambda: client.get_pull_request_files(**args),
+            'get_pull_request_reviews': lambda: client.get_pull_request_reviews(**args),
+            'get_pull_request_status': lambda: client.get_pull_request_status(**args),
+            'get_pull_request_comments': lambda: client.get_pull_request_comments(**args),
+            'get_pull_request_diff': lambda: client.get_pull_request_diff(**args),
+            'update_pull_request_branch': lambda: client.update_pull_request_branch(**args),
+            'search_pull_requests': lambda: client.search_pull_requests(**args),
+
+            # Repository and Files
             'create_branch': lambda: client.create_branch(**args),
             'list_branches': lambda: client.list_branches(**args),
+            'list_commits': lambda: client.list_commits(**args),
+            'get_commit': lambda: client.get_commit(**args),
+            'get_file_contents': lambda: client.get_file_contents(**args),
             'create_or_update_file': lambda: client.create_or_update_file(**args),
-            'run_workflow': lambda: client.run_workflow(**args),
+            'delete_file': lambda: client.delete_file(**args),
+            'push_files': lambda: client.push_files(**args),
+
+            # Tags and Releases
+            'list_tags': lambda: client.list_tags(**args),
+            'get_tag': lambda: client.get_tag(**args),
+            'list_releases': lambda: client.list_releases(**args),
+            'get_latest_release': lambda: client.get_latest_release(**args),
+            'get_release_by_tag': lambda: client.get_release_by_tag(**args),
+
+            # Workflows
             'list_workflows': lambda: client.list_workflows(**args),
+            'list_workflow_runs': lambda: client.list_workflow_runs(**args),
+            'get_workflow_run': lambda: client.get_workflow_run(**args),
+            'get_workflow_run_usage': lambda: client.get_workflow_run_usage(**args),
+            'get_workflow_run_logs': lambda: client.get_workflow_run_logs(**args),
+            'get_job_logs': lambda: client.get_job_logs(**args),
+            'list_workflow_jobs': lambda: client.list_workflow_jobs(**args),
+            'list_workflow_run_artifacts': lambda: client.list_workflow_run_artifacts(**args),
+            'download_workflow_run_artifact': lambda: client.download_workflow_run_artifact(**args),
+            'run_workflow': lambda: client.run_workflow(**args),
+            'rerun_workflow_run': lambda: client.rerun_workflow_run(**args),
+            'rerun_failed_jobs': lambda: client.rerun_failed_jobs(**args),
+            'cancel_workflow_run': lambda: client.cancel_workflow_run(**args),
+
+            # Search
+            'search_code': lambda: client.search_code(**args),
+
+            # Security
+            'list_code_scanning_alerts': lambda: client.list_code_scanning_alerts(**args),
+            'get_code_scanning_alert': lambda: client.get_code_scanning_alert(**args),
+            'list_dependabot_alerts': lambda: client.list_dependabot_alerts(**args),
+            'get_dependabot_alert': lambda: client.get_dependabot_alert(**args),
+            'list_secret_scanning_alerts': lambda: client.list_secret_scanning_alerts(**args),
+            'get_secret_scanning_alert': lambda: client.get_secret_scanning_alert(**args),
+
+            # Notifications and Users
+            'list_notifications': lambda: client.list_notifications(**args),
+            'mark_notifications_read': lambda: client.mark_notifications_read(**args),
+            'search_users': lambda: client.search_users(**args),
+            'search_orgs': lambda: client.search_orgs(**args),
+
+            # Discussions and Gists
+            'list_discussions': lambda: client.list_discussions(**args),
+            'get_discussion': lambda: client.get_discussion(**args),
+            'list_discussion_comments': lambda: client.list_discussion_comments(**args),
+            'create_gist': lambda: client.create_gist(**args),
+            'list_gists': lambda: client.list_gists(**args),
+            'update_gist': lambda: client.update_gist(**args),
         }
 
         action = action_map.get(tool)
@@ -269,6 +348,40 @@ def execute_github_action(client, tool: str, args: dict) -> dict:
         return {'success': True, 'data': result}
     except Exception as e:
         return {'error': str(e)}
+
+
+def find_best_jira_transition(transitions: List[Dict], target_state: str) -> Optional[str]:
+    """Find the best matching Jira transition for the target state."""
+    if not transitions:
+        return None
+
+    # Normalize target state
+    target_lower = target_state.lower()
+
+    # Priority order for different states
+    state_mappings = {
+        'done': ['done', 'close', 'closed', 'resolve', 'resolved', 'complete', 'completed'],
+        'closed': ['close', 'closed', 'done', 'resolve', 'resolved'],
+        'open': ['reopen', 'open', 'start', 'in progress', 'to do'],
+    }
+
+    search_terms = state_mappings.get(target_lower, [target_lower])
+
+    # Look for exact matches first
+    for term in search_terms:
+        for transition in transitions:
+            transition_name = transition.get('name', '').lower()
+            if term == transition_name:
+                return transition.get('id')
+
+    # Look for partial matches
+    for term in search_terms:
+        for transition in transitions:
+            transition_name = transition.get('name', '').lower()
+            if term in transition_name or transition_name in term:
+                return transition.get('id')
+
+    return None
 
 
 def execute_jira_action(client, tool: str, args: dict) -> dict:
@@ -305,8 +418,27 @@ def execute_jira_action(client, tool: str, args: dict) -> dict:
             cleaned_args = {k: v for k, v in args.items() if k in valid_params}
             args = cleaned_args
 
-        if tool == 'search' and 'jql' not in args and st.session_state.jira_project:
+        elif tool == 'search' and 'jql' not in args and st.session_state.jira_project:
             args['jql'] = f'project = "{st.session_state.jira_project}" ORDER BY created DESC'
+
+        elif tool == 'transition_issue':
+            # Handle smart transition resolution
+            if 'target_state' in args:
+                target_state = args.pop('target_state')
+                issue_key = args.get('issue_key')
+
+                if issue_key:
+                    # Get available transitions
+                    transitions_result = client.list_transitions(issue_key)
+                    transitions = transitions_result.get('transitions', [])
+
+                    # Find best matching transition
+                    transition_id = find_best_jira_transition(transitions, target_state)
+
+                    if transition_id:
+                        args['transition_id'] = transition_id
+                    else:
+                        return {'error': f'No suitable transition found for state "{target_state}"'}
 
         action_map = {
             'create_issue': lambda: client.create_issue(**args),
@@ -401,96 +533,29 @@ def execute_notion_action(client, tool: str, args: dict) -> dict:
 
 
 def get_ai_response_with_actions(user_message: str, model: str) -> Dict[str, Any]:
-    """Get AI response with actions - simplified version."""
+    """Get AI response with actions using the improved LLM agent."""
     if not st.session_state.openai_key:
         return {'error': 'OpenAI API key not configured'}
 
-    client = get_openai_client()
-    if not client:
-        return {'error': 'Failed to initialize OpenAI client'}
-
-    # Build context
-    context_parts = []
-    if st.session_state.github_client:
-        context_parts.append(f"GitHub: {st.session_state.gh_owner}/{st.session_state.gh_repo}")
-    if st.session_state.jira_client:
-        context_parts.append(f"Jira: {st.session_state.jira_project}")
-    if st.session_state.notion_client:
-        context_parts.append(f"Notion: Connected")
-
-    context = " | ".join(context_parts) if context_parts else "No services connected"
-
-    system_prompt = f"""You are an AI assistant that executes GitHub, Jira, and Notion tasks.
-
-Current Context: {context}
-
-CAPABILITIES:
-GitHub (if connected): create_issue, list_issues, create_pull_request, list_pull_requests, create_branch, list_branches
-Jira (if connected): create_issue, search, add_comment, project_info, whoami
-Notion (if connected): create_page, query_database, search, get_bot_info
-
-CRITICAL PARAMETER RULES:
-For Jira create_issue, ONLY use these parameters:
-- "summary" (for the title/name)
-- "description" (for the content/body)
-- "project_key" (will be auto-filled if not provided)
-
-For GitHub create_issue, use:
-- "title" (for the issue title)
-- "body" (for the content)
-
-For Notion create_page, use:
-- "properties" (formatted object)
-
-RESPONSE FORMAT (JSON only):
-{{
-    "message": "Your response to the user",
-    "actions": [
-        {{
-            "service": "github|jira|notion",
-            "action": "function_name",
-            "args": {{"param": "value"}},
-            "description": "What this does"
-        }}
-    ]
-}}
-
-Examples:
-- "Create Jira issue title Blue content Bottle" → {{"service": "jira", "action": "create_issue", "args": {{"summary": "Blue", "description": "Bottle"}}}}
-- "Create GitHub issue title Bug content Fix login" → {{"service": "github", "action": "create_issue", "args": {{"title": "Bug", "body": "Fix login"}}}}
-- "Show me Jira issues" → {{"service": "jira", "action": "search", "args": {{}}}}
-
-Always execute requested tasks immediately using the EXACT parameter names specified above."""
-
     try:
-        response = client.chat.completions.create(
+        # Use the improved propose_actions function
+        result = propose_actions(
+            openai_key=st.session_state.openai_key,
             model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
-            temperature=0.3,
-            max_tokens=1500
+            user_message=user_message,
+            gh_owner=st.session_state.gh_owner,
+            gh_repo=st.session_state.gh_repo,
+            jira_project_key=st.session_state.jira_project,
+            notion_database_id=st.session_state.notion_database_id
         )
 
-        response_text = response.choices[0].message.content
-
-        # Parse JSON with fallbacks
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            # Try to extract JSON
-            json_match = re.search(r'```json\n(.*?)\n```', response_text, re.DOTALL)
-            if json_match:
-                try:
-                    return json.loads(json_match.group(1))
-                except:
-                    pass
-
-            # Fallback
-            return {"message": response_text, "actions": []}
+        return {
+            "message": result.get("message", "Task processed"),
+            "actions": result.get("actions", [])
+        }
 
     except Exception as e:
+        logger.error(f"AI response error: {e}")
         return {'error': f'AI response error: {str(e)}'}
 
 
@@ -534,22 +599,17 @@ def execute_actions(actions: List[Dict]) -> List[Dict]:
     return results
 
 
-def create_github_issues_table(issues_data: List[Dict]) -> str:
-    """Create a formatted table for GitHub issues."""
+def create_github_issues_dataframe(issues_data: List[Dict]) -> pd.DataFrame:
+    """Create a pandas DataFrame for GitHub issues."""
     if not issues_data:
-        return "No issues found."
+        return pd.DataFrame()
 
-    # Prepare data for table
+    # Prepare data for DataFrame - same columns as before
     table_data = []
-    for issue in issues_data[:25]:  # Show up to 25 issues
-        # Handle both API response formats
+    for issue in issues_data:
         if isinstance(issue, dict):
             number = issue.get('number', 'N/A')
             title = issue.get('title', 'No title')
-            # Truncate title but keep it readable
-            if len(title) > 50:
-                title = title[:47] + "..."
-
             state = issue.get('state', 'unknown').upper()
             created_at = issue.get('created_at', '')
             assignee = 'Unassigned'
@@ -558,9 +618,9 @@ def create_github_issues_table(issues_data: List[Dict]) -> str:
             if created_at:
                 try:
                     date_obj = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    created_at = date_obj.strftime('%m/%d/%y')
+                    created_at = date_obj.strftime('%Y-%m-%d')
                 except:
-                    created_at = created_at[:10]  # Keep first 10 chars if parsing fails
+                    created_at = created_at[:10]
 
             # Get assignee info
             if issue.get('assignee') and isinstance(issue['assignee'], dict):
@@ -571,141 +631,150 @@ def create_github_issues_table(issues_data: List[Dict]) -> str:
             # Get labels
             labels = []
             if issue.get('labels'):
-                labels = [label.get('name', '') for label in issue['labels'][:2]]  # Max 2 labels
+                labels = [label.get('name', '') for label in issue['labels'][:3]]
             labels_str = ', '.join(labels) if labels else '-'
 
-            table_data.append([
-                f"#{number}",
-                title,
-                state,
-                created_at,
-                assignee,
-                labels_str
-            ])
+            table_data.append({
+                'Number': f"#{number}",
+                'Title': title,
+                'State': state,
+                'Created': created_at,
+                'Assignee': assignee,
+                'Labels': labels_str
+            })
 
-    if table_data:
-        # Create a clean table format
-        headers = ['Number', 'Title', 'State', 'Created', 'Assignee', 'Labels']
-
-        # Calculate column widths
-        col_widths = [max(len(str(row[i])) for row in [headers] + table_data) for i in range(len(headers))]
-        col_widths = [min(w, 50) for w in col_widths]  # Cap width at 50 chars
-
-        # Create table
-        table_lines = []
-
-        # Header
-        header_line = '| ' + ' | '.join(headers[i].ljust(col_widths[i]) for i in range(len(headers))) + ' |'
-        separator_line = '|' + '|'.join('-' * (col_widths[i] + 2) for i in range(len(headers))) + '|'
-
-        table_lines.append(header_line)
-        table_lines.append(separator_line)
-
-        # Data rows
-        for row in table_data:
-            row_line = '| ' + ' | '.join(
-                str(row[i]).ljust(col_widths[i])[:col_widths[i]] for i in range(len(row))) + ' |'
-            table_lines.append(row_line)
-
-        return f"\n\n**GitHub Issues ({len(issues_data)} total, showing {len(table_data)}):**\n```\n" + '\n'.join(
-            table_lines) + "\n```"
-
-    return "No issues to display."
+    return pd.DataFrame(table_data)
 
 
-def create_jira_issues_table(issues_data: List[Dict]) -> str:
-    """Create a formatted table for Jira issues."""
+def create_jira_issues_dataframe(issues_data: List[Dict]) -> pd.DataFrame:
+    """Create a pandas DataFrame for Jira issues with bulletproof data extraction."""
     if not issues_data:
-        return "No issues found."
+        return pd.DataFrame()
 
     table_data = []
-    for issue in issues_data[:25]:  # Show up to 25 issues
+    for issue in issues_data:
         if isinstance(issue, dict):
+            # Extract key
             key = issue.get('key', 'N/A')
+
+            # Extract fields with multiple fallbacks
             fields = issue.get('fields', {})
 
-            summary = fields.get('summary', 'No title')
-            if len(summary) > 45:
-                summary = summary[:42] + "..."
+            # Summary extraction with fallbacks
+            summary = None
+            summary_candidates = [
+                fields.get('summary'),
+                issue.get('summary'),
+                fields.get('title'),
+                issue.get('title'),
+                fields.get('name'),
+                issue.get('name'),
+                fields.get('subject'),
+                issue.get('subject')
+            ]
+            for candidate in summary_candidates:
+                if candidate and isinstance(candidate, str) and candidate.strip():
+                    summary = candidate.strip()
+                    break
 
+            if not summary:
+                summary = 'No title'
+                logger.debug(f"No summary found for {key}")
+
+            # Status extraction with fallbacks
             status = 'Unknown'
-            assignee = 'Unassigned'
-            created = ''
-            priority = '-'
+            status_obj = fields.get('status')
+            if status_obj and isinstance(status_obj, dict):
+                status = status_obj.get('name', 'Unknown')
+            elif isinstance(status_obj, str):
+                status = status_obj
+            else:
+                # Try alternate status fields
+                status_candidates = [
+                    fields.get('statusCategory', {}).get('name') if isinstance(fields.get('statusCategory'),
+                                                                               dict) else None,
+                    fields.get('state'),
+                    issue.get('status'),
+                    issue.get('state')
+                ]
+                for candidate in status_candidates:
+                    if candidate and isinstance(candidate, str):
+                        status = candidate
+                        break
+
+            # Issue type extraction
             issue_type = '-'
+            issuetype_obj = fields.get('issuetype') or fields.get('issueType') or fields.get('type')
+            if issuetype_obj and isinstance(issuetype_obj, dict):
+                issue_type = issuetype_obj.get('name', '-')
+            elif isinstance(issuetype_obj, str):
+                issue_type = issuetype_obj
 
-            # Get status
-            if fields.get('status') and isinstance(fields['status'], dict):
-                status = fields['status'].get('name', 'Unknown')
+            # Priority extraction
+            priority = '-'
+            priority_obj = fields.get('priority')
+            if priority_obj and isinstance(priority_obj, dict):
+                priority = priority_obj.get('name', '-')
+            elif isinstance(priority_obj, str):
+                priority = priority_obj
 
-            # Get assignee
-            if fields.get('assignee') and isinstance(fields['assignee'], dict):
-                assignee = fields['assignee'].get('displayName', 'Unknown')
-                if len(assignee) > 15:
-                    assignee = assignee[:12] + "..."
+            # Assignee extraction with fallbacks
+            assignee = 'Unassigned'
+            assignee_obj = fields.get('assignee')
+            if assignee_obj and isinstance(assignee_obj, dict):
+                assignee_candidates = [
+                    assignee_obj.get('displayName'),
+                    assignee_obj.get('name'),
+                    assignee_obj.get('emailAddress'),
+                    assignee_obj.get('accountId')
+                ]
+                for candidate in assignee_candidates:
+                    if candidate and isinstance(candidate, str):
+                        assignee = candidate
+                        if len(assignee) > 20:
+                            assignee = assignee[:17] + "..."
+                        break
 
-            # Get created date
-            if fields.get('created'):
-                try:
-                    date_obj = datetime.fromisoformat(fields['created'].replace('Z', '+00:00'))
-                    created = date_obj.strftime('%m/%d/%y')
-                except:
-                    created = fields['created'][:10]
+            # Created date extraction with fallbacks
+            created = ''
+            created_candidates = [
+                fields.get('created'),
+                fields.get('createdDate'),
+                issue.get('created'),
+                issue.get('createdDate')
+            ]
+            for candidate in created_candidates:
+                if candidate:
+                    try:
+                        date_obj = datetime.fromisoformat(str(candidate).replace('Z', '+00:00'))
+                        created = date_obj.strftime('%Y-%m-%d')
+                        break
+                    except:
+                        # Fallback to first 10 characters
+                        created = str(candidate)[:10]
+                        if len(created) >= 8:  # Reasonable date length
+                            break
 
-            # Get priority
-            if fields.get('priority') and isinstance(fields['priority'], dict):
-                priority = fields['priority'].get('name', '-')
+            table_data.append({
+                'Key': key,
+                'Summary': summary,
+                'Status': status,
+                'Type': issue_type,
+                'Priority': priority,
+                'Created': created,
+                'Assignee': assignee
+            })
 
-            # Get issue type
-            if fields.get('issuetype') and isinstance(fields['issuetype'], dict):
-                issue_type = fields['issuetype'].get('name', '-')
-
-            table_data.append([
-                key,
-                summary,
-                status,
-                issue_type,
-                priority,
-                created,
-                assignee
-            ])
-
-    if table_data:
-        headers = ['Key', 'Summary', 'Status', 'Type', 'Priority', 'Created', 'Assignee']
-
-        # Calculate column widths
-        col_widths = [max(len(str(row[i])) for row in [headers] + table_data) for i in range(len(headers))]
-        col_widths = [min(w, 45) for w in col_widths]  # Cap width
-
-        # Create table
-        table_lines = []
-
-        # Header
-        header_line = '| ' + ' | '.join(headers[i].ljust(col_widths[i]) for i in range(len(headers))) + ' |'
-        separator_line = '|' + '|'.join('-' * (col_widths[i] + 2) for i in range(len(headers))) + '|'
-
-        table_lines.append(header_line)
-        table_lines.append(separator_line)
-
-        # Data rows
-        for row in table_data:
-            row_line = '| ' + ' | '.join(
-                str(row[i]).ljust(col_widths[i])[:col_widths[i]] for i in range(len(row))) + ' |'
-            table_lines.append(row_line)
-
-        return f"\n\n**Jira Issues ({len(issues_data)} total, showing {len(table_data)}):**\n```\n" + '\n'.join(
-            table_lines) + "\n```"
-
-    return "No issues to display."
+    return pd.DataFrame(table_data)
 
 
-def create_notion_pages_table(pages_data: List[Dict]) -> str:
-    """Create a formatted table for Notion pages."""
+def create_notion_pages_dataframe(pages_data: List[Dict]) -> pd.DataFrame:
+    """Create a pandas DataFrame for Notion pages."""
     if not pages_data:
-        return "No pages found."
+        return pd.DataFrame()
 
     table_data = []
-    for page in pages_data[:25]:  # Show up to 25 pages
+    for page in pages_data:
         if isinstance(page, dict):
             # Extract title from properties
             title = "Untitled"
@@ -718,8 +787,6 @@ def create_notion_pages_table(pages_data: List[Dict]) -> str:
                     title_texts = prop_data.get('title', [])
                     if title_texts:
                         title = ''.join([t.get('plain_text', '') for t in title_texts])
-                        if len(title) > 40:
-                            title = title[:37] + "..."
                 elif 'status' in prop_name.lower() and prop_data.get('type') == 'select':
                     select_data = prop_data.get('select')
                     if select_data:
@@ -729,52 +796,28 @@ def create_notion_pages_table(pages_data: List[Dict]) -> str:
             if page.get('created_time'):
                 try:
                     date_obj = datetime.fromisoformat(page['created_time'].replace('Z', '+00:00'))
-                    created = date_obj.strftime('%m/%d/%y')
+                    created = date_obj.strftime('%Y-%m-%d')
                 except:
                     created = page['created_time'][:10]
 
-            table_data.append([
-                title,
-                status,
-                page.get('object', 'page').title(),
-                created
-            ])
+            table_data.append({
+                'Title': title,
+                'Status': status,
+                'Type': page.get('object', 'page').title(),
+                'Created': created
+            })
 
-    if table_data:
-        headers = ['Title', 'Status', 'Type', 'Created']
-
-        # Calculate column widths
-        col_widths = [max(len(str(row[i])) for row in [headers] + table_data) for i in range(len(headers))]
-        col_widths = [min(w, 50) for w in col_widths]
-
-        # Create table
-        table_lines = []
-
-        # Header
-        header_line = '| ' + ' | '.join(headers[i].ljust(col_widths[i]) for i in range(len(headers))) + ' |'
-        separator_line = '|' + '|'.join('-' * (col_widths[i] + 2) for i in range(len(headers))) + '|'
-
-        table_lines.append(header_line)
-        table_lines.append(separator_line)
-
-        # Data rows
-        for row in table_data:
-            row_line = '| ' + ' | '.join(
-                str(row[i]).ljust(col_widths[i])[:col_widths[i]] for i in range(len(row))) + ' |'
-            table_lines.append(row_line)
-
-        return f"\n\n**Notion Pages ({len(pages_data)} total, showing {len(table_data)}):**\n```\n" + '\n'.join(
-            table_lines) + "\n```"
-
-    return "No pages to display."
+    return pd.DataFrame(table_data)
 
 
-def format_execution_results(results: List[Dict]) -> str:
-    """Format results for display with improved table formatting."""
+def format_execution_results_with_tables(results: List[Dict]) -> Tuple[str, List[pd.DataFrame], List[str]]:
+    """Format results for display - return text summary, DataFrames, and table titles."""
     if not results:
-        return ""
+        return "", [], []
 
-    formatted = "\n\n**Results:**\n"
+    summary_parts = []
+    dataframes = []
+    table_titles = []
 
     for result in results:
         action = result['action']
@@ -786,69 +829,70 @@ def format_execution_results(results: List[Dict]) -> str:
 
             if isinstance(data, dict):
                 if 'number' in data:  # GitHub issue/PR created
-                    formatted += f"\n✅ {service}: Issue #{data['number']} created"
+                    summary_parts.append(f"✅ {service}: Issue #{data['number']} created")
                     if 'html_url' in data:
-                        formatted += f" - {data['html_url']}"
+                        summary_parts.append(f"   🔗 {data['html_url']}")
                 elif 'key' in data:  # Jira issue created
-                    formatted += f"\n✅ {service}: {data['key']} created"
+                    summary_parts.append(f"✅ {service}: {data['key']} created")
                 elif 'displayName' in data:  # Jira user info
-                    formatted += f"\n✅ {service}: User - {data['displayName']}"
+                    summary_parts.append(f"✅ {service}: User - {data['displayName']}")
                 elif 'name' in data and service == 'Notion':  # Notion bot
-                    formatted += f"\n✅ {service}: Bot - {data['name']}"
+                    summary_parts.append(f"✅ {service}: Bot - {data['name']}")
                 else:
-                    formatted += f"\n✅ {service}: {action} completed"
+                    summary_parts.append(f"✅ {service}: {action} completed")
 
             elif isinstance(data, list):  # List results
-                formatted += f"\n✅ {service}: Found {len(data)} items"
+                summary_parts.append(f"✅ {service}: Found {len(data)} items")
 
-                # Use specialized table formatters for different services
+                # Create DataFrames for different services
                 if service.lower() == 'github' and data:
                     # Check if this looks like issues (has number and title)
                     if any('number' in item and 'title' in item for item in data[:3] if isinstance(item, dict)):
-                        formatted += create_github_issues_table(data)
+                        df = create_github_issues_dataframe(data)
+                        if not df.empty:
+                            dataframes.append(df)
+                            table_titles.append("GitHub Issues")
                     else:
-                        # Fallback for other GitHub data
-                        formatted += "\n"
-                        for item in data[:20]:  # Show up to 20 items
+                        # Handle other GitHub list data generically
+                        generic_data = []
+                        for item in data[:50]:  # Limit to 50 items
                             if isinstance(item, dict):
+                                row = {}
                                 if 'name' in item:
-                                    formatted += f"\n  • {item['name']}"
-                                elif 'number' in item and 'title' in item:
-                                    formatted += f"\n  • #{item['number']}: {item['title'][:50]}..."
+                                    row['Name'] = item['name']
+                                if 'login' in item:
+                                    row['Login'] = item['login']
+                                if 'created_at' in item:
+                                    row['Created'] = item['created_at'][:10]
+                                if row:  # Only add if we extracted some data
+                                    generic_data.append(row)
 
-                        if len(data) > 20:
-                            formatted += f"\n  ... and {len(data) - 20} more items"
+                        if generic_data:
+                            df = pd.DataFrame(generic_data)
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append(f"GitHub {action.title()}")
 
                 elif service.lower() == 'jira' and data:
-                    formatted += create_jira_issues_table(data)
+                    df = create_jira_issues_dataframe(data)
+                    if not df.empty:
+                        dataframes.append(df)
+                        table_titles.append("Jira Issues")
 
                 elif service.lower() == 'notion' and data:
-                    formatted += create_notion_pages_table(data)
-
-                else:
-                    # Generic list formatting
-                    formatted += "\n"
-                    for item in data[:20]:  # Show up to 20 items
-                        if isinstance(item, dict):
-                            if 'name' in item:
-                                formatted += f"\n  • {item['name']}"
-                            elif 'title' in item:
-                                formatted += f"\n  • {item['title'][:50]}..."
-                            elif 'summary' in item:
-                                formatted += f"\n  • {item['summary'][:50]}..."
-                            else:
-                                formatted += f"\n  • {str(item)[:50]}..."
-
-                    if len(data) > 20:
-                        formatted += f"\n  ... and {len(data) - 20} more items"
+                    df = create_notion_pages_dataframe(data)
+                    if not df.empty:
+                        dataframes.append(df)
+                        table_titles.append("Notion Pages")
 
             else:
-                formatted += f"\n✅ {service}: {action} completed"
+                summary_parts.append(f"✅ {service}: {action} completed")
         else:
             error = result['result'].get('error', 'Unknown error')
-            formatted += f"\n❌ {service}: {action} failed - {error[:100]}"
+            summary_parts.append(f"❌ {service}: {action} failed - {error[:100]}")
 
-    return formatted
+    summary_text = "\n".join(summary_parts)
+    return summary_text, dataframes, table_titles
 
 
 def handle_chat_message(user_input: str, model: str):
@@ -885,10 +929,16 @@ def handle_chat_message(user_input: str, model: str):
 
         # Execute actions if any
         execution_results = []
+        dataframes = []
+        table_titles = []
+
         if actions:
             execution_results = execute_actions(actions)
-            results_text = format_execution_results(execution_results)
-            message += results_text
+            results_text, dataframes, table_titles = format_execution_results_with_tables(execution_results)
+
+            # Only add results text to message if it's not empty
+            if results_text.strip():
+                message += f"\n\n{results_text}"
 
         execution_time = time.time() - start_time
 
@@ -898,14 +948,16 @@ def handle_chat_message(user_input: str, model: str):
             "content": message,
             "timestamp": datetime.now(),
             "actions_executed": len(actions),
-            "execution_time": execution_time
+            "execution_time": execution_time,
+            "dataframes": dataframes,
+            "table_titles": table_titles
         })
 
     st.rerun()
 
 
 def display_chat_history():
-    """Display clean chat history."""
+    """Display clean chat history with proper DataFrame rendering."""
     if not st.session_state.chat_history:
         st.info("Start chatting! Try: 'Show me what I have in Jira' or 'List my GitHub issues'")
         return
@@ -932,6 +984,15 @@ def display_chat_history():
                 {message['content'].replace(chr(10), '<br>')}
             </div>
             """, unsafe_allow_html=True)
+
+            # Display DataFrames if present
+            dataframes = message.get('dataframes', [])
+            table_titles = message.get('table_titles', [])
+
+            for i, df in enumerate(dataframes):
+                title = table_titles[i] if i < len(table_titles) else f"Table {i + 1}"
+                st.subheader(title)
+                st.dataframe(df, use_container_width=True)
 
 
 # ============================================================================
