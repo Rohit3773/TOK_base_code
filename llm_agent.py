@@ -34,7 +34,7 @@ GITHUB_TOOLS = [
     ToolDefinition('gh_get_issue', 'gh_get_issue(owner, repo, issue_number)', 'read', 5),
     ToolDefinition('gh_list_issues', 'gh_list_issues(owner, repo, state?, assignee?, labels?, sort?)', 'read', 5),
     ToolDefinition('gh_list_open_issues', 'gh_list_open_issues(owner, repo)', 'read', 5),
-    ToolDefinition('gh_search_issues', 'gh_search_issues(query, sort?, order?)', 'read', 6),
+    ToolDefinition('gh_search_issues', 'gh_search_issues(query, sort?, order?, per_page?)', 'read', 6),
     ToolDefinition('gh_add_issue_comment', 'gh_add_issue_comment(owner, repo, issue_number, body)', 'modify', 6),
 
     # Pull request operations
@@ -56,7 +56,7 @@ GITHUB_TOOLS = [
     ToolDefinition('gh_get_pull_request_diff', 'gh_get_pull_request_diff(owner, repo, pull_number)', 'read', 5),
     ToolDefinition('gh_update_pull_request_branch', 'gh_update_pull_request_branch(owner, repo, pull_number)', 'modify',
                    6),
-    ToolDefinition('gh_search_pull_requests', 'gh_search_pull_requests(query, sort?, order?)', 'read', 6),
+    ToolDefinition('gh_search_pull_requests', 'gh_search_pull_requests(query, sort?, order?, per_page?)', 'read', 6),
 
     # Repository and file operations
     ToolDefinition('gh_create_branch', 'gh_create_branch(owner, repo, branch, from_branch?)', 'create', 7),
@@ -163,11 +163,11 @@ def _extract_owner_repo(text: str) -> Optional[Tuple[str, str]]:
 
 @lru_cache(maxsize=64)
 def _extract_issue_number(text: str) -> Optional[int]:
-    """Extract issue/PR number from text like '#123' or URLs."""
+    """Extract issue/PR number from text like '#123' or URLs with improved accuracy."""
     if not text:
         return None
 
-    # Look for #number pattern
+    # Look for #number pattern first (most specific)
     number_match = re.search(r'#(\d+)', text)
     if number_match:
         return int(number_match.group(1))
@@ -184,24 +184,55 @@ def _extract_issue_number(text: str) -> Optional[int]:
             return int(match.group(1))
 
     # Look for standalone numbers if context suggests it's an issue
-    if 'issue' in text.lower() or 'pr' in text.lower():
+    issue_keywords = ['issue', 'pr', 'pull request', 'bug', 'ticket', 'github']
+    text_lower = text.lower()
+    if any(keyword in text_lower for keyword in issue_keywords):
         number_match = re.search(r'\b(\d+)\b', text)
         if number_match:
-            return int(number_match.group(1))
+            num = int(number_match.group(1))
+            # Reasonable range check for issue numbers
+            if 1 <= num <= 999999:
+                return num
 
     return None
 
 
 @lru_cache(maxsize=64)
 def _extract_jira_key(text: str) -> Optional[str]:
-    """Extract Jira issue key like 'PROJECT-123'."""
+    """Extract Jira issue key like 'PROJECT-123' with improved patterns."""
     if not text:
         return None
 
-    # Look for PROJECT-123 pattern
-    jira_match = re.search(r'\b([A-Z][A-Z0-9]+-\d+)\b', text)
+    # Look for PROJECT-123 pattern (more robust)
+    jira_match = re.search(r'\b([A-Z][A-Z0-9]{1,9}-\d+)\b', text)
     if jira_match:
         return jira_match.group(1)
+
+    return None
+
+
+@lru_cache(maxsize=64)
+def _extract_issue_title(text: str) -> Optional[str]:
+    """Extract issue title from various patterns."""
+    if not text:
+        return None
+
+    # Patterns for extracting titles
+    title_patterns = [
+        r'issue\s+(?:titled|named|called)\s*["\']([^"\']+)["\']',
+        r'issue\s+["\']([^"\']+)["\']',
+        r'(?:details|info|about)\s+(?:issue\s+)?["\']([^"\']+)["\']',
+        r'(?:details|info|about)\s+(?:GitHub\s+)?issue\s+([A-Za-z][A-Za-z0-9\s]+)',
+        r'GitHub\s+issue\s+([A-Za-z][A-Za-z0-9\s]+?)(?:\s|$)',
+    ]
+
+    for pattern in title_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            title = match.group(1).strip()
+            # Filter out common false positives
+            if len(title) > 1 and not title.isdigit() and title.lower() not in ['details', 'info', 'about']:
+                return title
 
     return None
 
@@ -220,28 +251,27 @@ def _infer_platform_intent(
 
     # Enhanced keyword detection
     github_keywords = {'github', 'repo', 'repository', 'pull request', 'pr', 'branch', 'commit', 'workflow', 'release',
-                       'tag', 'gist'}
-    jira_keywords = {'jira', 'issue', 'ticket', 'project', 'jql', 'epic', 'story', 'bug', 'task'}
+                       'tag', 'gist', 'file contents', 'merge'}
+    jira_keywords = {'jira', 'issue', 'ticket', 'project', 'jql', 'epic', 'story', 'bug', 'task', 'transition'}
 
     # Count keyword occurrences for confidence scoring
     gh_score = sum(1 for kw in github_keywords if kw in msg_lower)
     jira_score = sum(1 for kw in jira_keywords if kw in msg_lower)
 
-    # Check for explicit repo patterns
+    # Check for explicit patterns
     has_repo_pattern = _extract_owner_repo(user_message) is not None
+    has_gh_issue = _extract_issue_number(user_message) is not None
+    has_jira_key = _extract_jira_key(user_message) is not None
+
     if has_repo_pattern:
         gh_score += 2
+    if has_gh_issue:
+        gh_score += 2
+    if has_jira_key:
+        jira_score += 3
 
-    # Check for Jira issue patterns (PROJECT-123)
-    if _extract_jira_key(user_message):
-        jira_score += 2
-
-    # Check for GitHub issue patterns (#123)
-    if _extract_issue_number(user_message):
-        gh_score += 1
-
-    mentions_github = gh_score > 0 or has_repo_pattern
-    mentions_jira = jira_score > 0
+    mentions_github = gh_score > 0 or has_repo_pattern or has_gh_issue
+    mentions_jira = jira_score > 0 or has_jira_key
 
     # Decision logic with context consideration
     if mentions_github and not mentions_jira:
@@ -255,14 +285,31 @@ def _infer_platform_intent(
         return (has_gh_context, has_jira_context)
 
 
+def _is_greeting(user_message: str) -> bool:
+    """Detect if message is a greeting."""
+    if not user_message:
+        return False
+
+    msg_lower = user_message.lower().strip()
+    greeting_patterns = [
+        r'^(hi|hello|hey|greetings|good\s+(morning|afternoon|evening))[\s!.]*$',
+        r'^(what\'s\s+up|sup|howdy)[\s!.]*$',
+        r'^(how\s+are\s+you|how\'s\s+it\s+going)[\s!.?]*$'
+    ]
+
+    return any(re.match(pattern, msg_lower) for pattern in greeting_patterns)
+
+
 def _detect_status_change_intent(user_message: str) -> Optional[Tuple[str, str]]:
     """Detect status change intent and return (platform, new_state)."""
     msg_lower = user_message.lower()
 
-    # Status change keywords
-    close_keywords = ['close', 'closed', 'mark closed', 'set closed']
-    reopen_keywords = ['reopen', 'open', 'mark open', 'set open']
-    resolve_keywords = ['resolve', 'resolved', 'mark resolved', 'done', 'complete', 'finished']
+    # Status change keywords with more patterns
+    close_keywords = ['close', 'closed', 'mark closed', 'set closed', 'mark as closed', 'set to closed']
+    reopen_keywords = ['reopen', 'open', 'mark open', 'set open', 'mark as open', 'set to open']
+    resolve_keywords = ['resolve', 'resolved', 'mark resolved', 'done', 'complete', 'finished', 'mark done',
+                        'mark as done', 'mark to done', 'move to done', 'set to done']
+    progress_keywords = ['in progress', 'start', 'started', 'begin', 'working on']
 
     # Check for GitHub or Jira context
     has_github_ref = _extract_issue_number(user_message) or 'github' in msg_lower
@@ -276,6 +323,8 @@ def _detect_status_change_intent(user_message: str) -> Optional[Tuple[str, str]]
         new_state = 'open'
     elif any(kw in msg_lower for kw in resolve_keywords):
         new_state = 'done'  # For Jira, we'll map this to transitions
+    elif any(kw in msg_lower for kw in progress_keywords):
+        new_state = 'in_progress'
 
     if not new_state:
         return None
@@ -296,7 +345,7 @@ def _detect_status_change_intent(user_message: str) -> Optional[Tuple[str, str]]
 
 
 def _build_github_search_query(user_message: str, owner: str, repo: str, item_type: str = 'issue') -> str:
-    """Build a proper GitHub search query."""
+    """Build a proper GitHub search query with improved title extraction."""
     query_parts = []
 
     # Add repo constraint if available
@@ -304,22 +353,38 @@ def _build_github_search_query(user_message: str, owner: str, repo: str, item_ty
         query_parts.append(f'repo:{owner}/{repo}')
 
     # Extract title text for search
-    msg_lower = user_message.lower()
+    title_text = _extract_issue_title(user_message)
 
-    # Remove common words and extract meaningful title terms
-    title_words = []
-    words = user_message.split()
-    skip_words = {'issue', 'pr', 'pull', 'request', 'github', 'about', 'details', 'show', 'me', 'find', 'get', 'the',
-                  'a', 'an'}
-
-    for word in words:
-        cleaned = re.sub(r'[^\w]', '', word.lower())
-        if len(cleaned) > 2 and cleaned not in skip_words:
-            title_words.append(word)
-
-    if title_words:
-        title_text = ' '.join(title_words[:5])  # Limit to 5 words
+    if title_text:
         query_parts.append(f'in:title "{title_text}"')
+        query_parts.append('state:all')  # Search all states by default
+    else:
+        # Extract meaningful search terms
+        msg_lower = user_message.lower()
+
+        # Look for quoted phrases first
+        quoted_matches = re.findall(r'"([^"]+)"', user_message)
+        for quote in quoted_matches:
+            if len(quote.strip()) > 2:
+                query_parts.append(f'"{quote.strip()}"')
+
+        if not quoted_matches:
+            # Extract key terms, excluding common words
+            words = user_message.split()
+            skip_words = {'issue', 'pr', 'pull', 'request', 'github', 'about', 'details', 'show', 'me', 'find', 'get',
+                          'the', 'a', 'an', 'search', 'for', 'with', 'in', 'of', 'and', 'or', 'but', 'is', 'are',
+                          'tell', 'what', 'how', 'why', 'when', 'where'}
+
+            search_terms = []
+            for word in words:
+                cleaned = re.sub(r'[^\w]', '', word.lower())
+                if len(cleaned) > 2 and cleaned not in skip_words and not cleaned.isdigit():
+                    search_terms.append(cleaned)
+
+            if search_terms:
+                # Use the first few meaningful terms
+                for term in search_terms[:2]:
+                    query_parts.append(f'"{term}"')
 
     # Add type constraint
     query_parts.append(f'type:{item_type}')
@@ -339,8 +404,18 @@ def _build_optimized_system_prompt(
     if allow_gh and allow_jira:
         tool_sections = [
             "GitHub Tools (service='github'):",
-            *[f"- {t.signature}" for t in GITHUB_TOOLS[:15]],  # Top 15 most important
-            "... and many more GitHub operations for files, workflows, security, etc.",
+            "- gh_get_issue(owner, repo, issue_number) - Get specific issue details",
+            "- gh_search_issues(query, per_page?) - Search issues (query REQUIRED)",
+            "- gh_create_issue(owner, repo, title, body?) - Create new issue",
+            "- gh_update_issue(owner, repo, issue_number, state?, title?, body?) - Update issue",
+            "- gh_add_issue_comment(owner, repo, issue_number, body) - Add comment",
+            "- gh_list_issues(owner, repo, state?, labels?) - List issues",
+            "- gh_create_pull_request(owner, repo, title, head, base, body?) - Create PR",
+            "- gh_list_branches(owner, repo) - List branches",
+            "- gh_get_file_contents(owner, repo, path, ref?) - Get file contents",
+            "- gh_create_or_update_file(owner, repo, path, content, message, branch?) - Create/update file",
+            "- gh_list_tags(owner, repo) - List tags",
+            "... and many more GitHub operations for workflows, security, etc.",
             "",
             "Jira Tools (service='jira'):",
             *[f"- {t.signature}" for t in JIRA_TOOLS],  # All Jira tools
@@ -354,8 +429,18 @@ def _build_optimized_system_prompt(
     elif allow_gh:
         tool_sections = [
             "Available GitHub Tools:",
-            *[f"- {t.signature}" for t in GITHUB_TOOLS[:20]],  # Show more when only GitHub
-            "... and additional operations for security, notifications, discussions, gists",
+            "- gh_get_issue(owner, repo, issue_number) - Get specific issue details",
+            "- gh_search_issues(query, per_page?) - Search issues (query REQUIRED)",
+            "- gh_create_issue(owner, repo, title, body?) - Create new issue",
+            "- gh_update_issue(owner, repo, issue_number, state?, title?, body?) - Update issue",
+            "- gh_add_issue_comment(owner, repo, issue_number, body) - Add comment",
+            "- gh_list_issues(owner, repo, state?, labels?) - List issues",
+            "- gh_create_pull_request(owner, repo, title, head, base, body?) - Create PR",
+            "- gh_list_branches(owner, repo) - List branches",
+            "- gh_get_file_contents(owner, repo, path, ref?) - Get file contents",
+            "- gh_create_or_update_file(owner, repo, path, content, message, branch?) - Create/update file",
+            "- gh_list_tags(owner, repo) - List tags",
+            "... and additional operations for security, notifications, workflows, etc.",
         ]
         routing_rules = [
             "- Use ONLY GitHub tools",
@@ -391,32 +476,101 @@ RESPONSE FORMAT (JSON only):
 ROUTING RULES:
 {chr(10).join(routing_rules)}
 
-CRITICAL SEARCH RULES:
-1. GitHub search_issues REQUIRES query parameter - never call without it
-2. For issue details by title: use search_issues with proper query format
-3. For issue by #number: use get_issue directly
-4. For status changes: use update_issue (GitHub) or transition_issue (Jira)
+CRITICAL ENTITY NORMALIZATION RULES:
 
-ISSUE REFERENCE PARSING:
-- "#123" or URLs → get_issue with issue_number
-- Title text → search_issues with query="repo:owner/repo in:title \"text\" type:issue"
-- Jira keys like "PROJECT-123" → use directly in Jira calls
+1. GREETING DETECTION:
+   - For simple greetings like "Hey", "Hello", "Hi" → return ONLY friendly message, NO actions
+   - Message: "Hi! I'm ready to help. I can list GitHub/Jira issues, show details, create issues/PRs, update statuses, etc."
 
-STATUS CHANGES:
-- GitHub: update_issue with state="closed|open"
-- Jira: list_transitions then transition_issue with matching transition_id
+2. GITHUB SEARCH WITH NO RESULTS HANDLING:
+   - For searches like "Search GitHub issues for memory leak" → use search_issues with query
+   - If no results found, message should be "No issues found for search term" 
+   - ALWAYS include a search action even if expecting no results
+
+3. GITHUB ISSUE REFERENCES:
+   - "#123" or "issue #123" → get_issue with issue_number=123
+   - "GitHub issue Blue" or "issue titled Blue" → search_issues first with query like 'repo:owner/repo "Blue" type:issue state:all'
+   - GitHub URLs → extract number, use get_issue
+
+4. JIRA ISSUE REFERENCES AND STATUS CHANGES:
+   - "ABC-123" → use issue_key="ABC-123" directly
+   - "set Jira issue MTP-11 to Done" → ALWAYS use list_transitions FIRST, then transition_issue
+   - For Jira status changes: MUST get transitions first to find correct transition_id
+   - Pattern: list_transitions(issue_key) → then transition_issue(issue_key, transition_id)
+
+5. SEARCH QUERIES ALWAYS REQUIRED:
+   - search_issues MUST have query parameter - never call without it
+   - For title searches: query = 'repo:owner/repo "Blue" type:issue state:all'
+   - For text searches: query = 'repo:owner/repo "memory leak" type:issue'
+   - search_pull_requests MUST have query parameter with type:pr
+
+6. PULL REQUEST CREATION:
+   - "Create pull request title X head Y base Z body W" → create_pull_request with ALL required params
+   - REQUIRED params: owner, repo, title, head, base
+   - OPTIONAL params: body, draft
+   - Example: {{"service": "github", "action": "create_pull_request", "args": {{"title": "Update docs", "head": "feature/test-cli", "base": "main", "body": "Add hello doc"}}}}
+
+7. FILE OPERATIONS:
+   - "Get file contents path: docs/HELLO.md from main branch" → get_file_contents(path="docs/HELLO.md", ref="main")
+   - ALWAYS include both path AND ref parameters
+
+8. BRANCH AND TAG LISTING:
+   - "List tags in GitHub" → list_tags(owner, repo) 
+   - "Tell me name of branches" → list_branches(owner, repo)
+   - These should return data for display
+
+9. DEFAULT GITHUB LISTING:
+   - "List GitHub issues" → ALWAYS use list_issues (not search_issues)
+   - "Show details for GitHub issue #N" → ALWAYS use get_issue(issue_number=N)
+   - Only use search_issues when explicitly searching with terms
+
+10. JIRA OPERATIONS:
+    - "Show my Jira issues" → search with JQL for current project
+    - "Mark Jira issue ABC-123 to Done" → list_transitions + transition_issue
+    - "Add comment to ABC-123" → add_comment(issue_key="ABC-123", body="...")
+
+11. ENHANCED ERROR HANDLING:
+    - For search operations that might return no results, always include helpful message
+    - For Jira transitions, always get available transitions first
+    - For PR creation, validate all required parameters are present
 
 MESSAGE RULES:
-- Keep messages concise - just counts and summaries
+- Keep messages concise: "Found 5 issues", "Retrieved file contents", "Branch created"
 - NO markdown tables in message - data shows in UI tables
-- Example: "Found 5 issues" not full issue listings
+- Be specific about what was done
+- For searches with no results: "No issues found matching your criteria"
 
-OPTIMIZATION GUIDELINES:
-- Prioritize actions by importance and dependencies
-- Group related operations logically
-- Use exact parameter names as specified
-- Never invent owner/repo/project values
-- Be concise but complete in your plan"""
+PARAMETER MAPPING:
+- Always use exact parameter names: issue_number (not issue_id), branch (not branch_name)
+- Include owner/repo in GitHub calls when available from context
+- For search_issues/search_pull_requests: query is MANDATORY
+- For get_file_contents: both path and ref are required
+- For Jira transitions: ALWAYS get transitions first, then use correct transition_id
+
+CRITICAL FIXES FOR COMMON FAILURES:
+
+1. SEARCH WITH NO RESULTS:
+   - Always perform search even if no results expected
+   - Message should indicate "No issues found" rather than generic response
+
+2. PULL REQUEST CREATION:
+   - Ensure ALL required parameters: owner, repo, title, head, base
+   - Do not skip any required parameters
+
+3. JIRA STATUS CHANGES:
+   - MUST use list_transitions first to get available transitions
+   - Then use transition_issue with correct transition_id from the list
+   - Never guess transition IDs
+
+4. FILE CONTENT RETRIEVAL:
+   - Always include both path and ref parameters
+   - Default ref to "main" if not specified
+
+5. BRANCH AND TAG LISTING:
+   - Use list_branches and list_tags with proper owner/repo
+   - Ensure data is returned for display
+
+Remember: Every action must have a clear purpose and proper parameters. Always provide helpful feedback even when operations fail or return no results."""
 
 
 # Client connection pool for better performance
@@ -530,85 +684,116 @@ def _enhance_actions_for_context(
         gh_owner: str,
         gh_repo: str
 ) -> List[Dict[str, Any]]:
-    """Enhance actions with context-specific improvements."""
+    """Enhance actions with context-specific improvements and intent detection."""
     enhanced_actions = []
 
-    # Check for status change intent
-    status_intent = _detect_status_change_intent(user_message)
+    # Extract entities from user message
     issue_number = _extract_issue_number(user_message)
     jira_key = _extract_jira_key(user_message)
+    issue_title = _extract_issue_title(user_message)
+    status_intent = _detect_status_change_intent(user_message)
+
+    # Check if this is a title-based GitHub issue lookup that needs search first
+    github_title_lookup = False
+    if issue_title and not issue_number and 'github' in user_message.lower():
+        # Look for patterns like "show details for GitHub issue Blue"
+        detail_patterns = [
+            r'(?:show|get|view)\s+(?:details|info)\s+(?:for\s+)?(?:github\s+)?issue\s+[\'"]?([^\'"\s]+)[\'"]?',
+            r'(?:details|info)\s+(?:for\s+)?(?:github\s+)?issue\s+[\'"]?([^\'"\s]+)[\'"]?'
+        ]
+        for pattern in detail_patterns:
+            if re.search(pattern, user_message, re.IGNORECASE):
+                github_title_lookup = True
+                break
 
     for action in actions:
         service = action.get("service", "")
         action_name = action.get("action", "")
         args = action.get("args", {})
 
-        # Handle GitHub search issues - ensure query is present
-        if service == "github" and action_name == "search_issues":
-            if "query" not in args or not args["query"]:
-                # Build a proper search query
-                query = _build_github_search_query(user_message, gh_owner, gh_repo, "issue")
-                args["query"] = query
-                action["args"] = args
+        # Enhanced GitHub issue handling
+        if service == "github":
+            # Add default owner/repo if missing
+            if 'owner' not in args and gh_owner:
+                args['owner'] = gh_owner
+            if 'repo' not in args and gh_repo:
+                args['repo'] = gh_repo
 
-        # Handle GitHub search pull requests - ensure query is present
-        elif service == "github" and action_name == "search_pull_requests":
-            if "query" not in args or not args["query"]:
-                query = _build_github_search_query(user_message, gh_owner, gh_repo, "pr")
-                args["query"] = query
-                action["args"] = args
+            # Handle title-based lookups - convert to search first, then get_issue
+            if github_title_lookup and action_name == "get_issue" and issue_title:
+                # Replace with search action
+                search_action = {
+                    "service": "github",
+                    "action": "search_issues",
+                    "args": {
+                        "query": f'repo:{gh_owner}/{gh_repo} "{issue_title}" type:issue state:all',
+                        "per_page": 10
+                    },
+                    "description": f"Search for issue titled '{issue_title}'"
+                }
+                enhanced_actions.append(search_action)
+                continue
 
-        # Handle issue details by number
-        elif service == "github" and issue_number and (
-                "detail" in user_message.lower() or "show" in user_message.lower()):
-            if action_name == "search_issues":
-                # Replace with direct get_issue call
+            # Handle issue details by number - prioritize direct get_issue over search
+            if action_name == "search_issues" and issue_number and any(
+                    word in user_message.lower() for word in ['detail', 'show', 'info', 'about']):
+                # Replace search with direct get_issue call for better results
                 action["action"] = "get_issue"
                 action["args"] = {"issue_number": issue_number}
                 action["description"] = f"Get details for issue #{issue_number}"
 
-        # Handle status changes
-        elif status_intent:
-            platform, new_state = status_intent
+            # Handle search_issues - ensure query is present and properly formatted
+            elif action_name == "search_issues":
+                if "query" not in args or not args["query"]:
+                    # Build a proper search query
+                    if issue_title:
+                        query = f'repo:{gh_owner}/{gh_repo} "{issue_title}" type:issue state:all'
+                    else:
+                        query = _build_github_search_query(user_message, gh_owner, gh_repo, "issue")
+                    args["query"] = query
+                    action["args"] = args
 
-            if service == "github" and platform == "github":
-                if action_name == "search_issues" and issue_number:
-                    # Add follow-up status change action
-                    enhanced_actions.append(action)  # Keep search
+            # Handle search_pull_requests - ensure query is present and properly formatted
+            elif action_name == "search_pull_requests":
+                if "query" not in args or not args["query"]:
+                    query = _build_github_search_query(user_message, gh_owner, gh_repo, "pr")
+                    args["query"] = query
+                    action["args"] = args
+
+            # Handle status changes with proper GitHub routing
+            if status_intent and status_intent[0] == "github" and issue_number:
+                platform, new_state = status_intent
+                if action_name in ["search_issues", "get_issue"]:
+                    # Keep the original action, then add status change
+                    enhanced_actions.append(action)
                     enhanced_actions.append({
                         "service": "github",
                         "action": "update_issue",
-                        "args": {"issue_number": issue_number, "state": new_state if new_state != "done" else "closed"},
-                        "description": f"Change issue #{issue_number} to {new_state}"
-                    })
-                    continue
-                elif action_name == "get_issue" and issue_number:
-                    # Add follow-up status change action
-                    enhanced_actions.append(action)  # Keep get
-                    enhanced_actions.append({
-                        "service": "github",
-                        "action": "update_issue",
-                        "args": {"issue_number": issue_number, "state": new_state if new_state != "done" else "closed"},
-                        "description": f"Change issue #{issue_number} to {new_state}"
+                        "args": {"issue_number": issue_number,
+                                 "state": new_state if new_state in ['closed', 'open'] else "closed"},
+                        "description": f"{'Close' if new_state in ['closed', 'done'] else 'Reopen'} issue #{issue_number}"
                     })
                     continue
 
-            elif service == "jira" and platform == "jira":
-                if jira_key:
-                    # For Jira status changes, we need to get transitions first
-                    enhanced_actions.append({
-                        "service": "jira",
-                        "action": "list_transitions",
-                        "args": {"issue_key": jira_key},
-                        "description": f"Get available transitions for {jira_key}"
-                    })
-                    enhanced_actions.append({
-                        "service": "jira",
-                        "action": "transition_issue",
-                        "args": {"issue_key": jira_key, "target_state": new_state},
-                        "description": f"Move {jira_key} to {new_state}"
-                    })
-                    continue
+        # Enhanced Jira handling
+        elif service == "jira":
+            # Handle status changes with proper Jira routing
+            if status_intent and status_intent[0] == "jira" and jira_key:
+                platform, new_state = status_intent
+                # For Jira status changes, we need to get transitions first
+                enhanced_actions.append({
+                    "service": "jira",
+                    "action": "list_transitions",
+                    "args": {"issue_key": jira_key},
+                    "description": f"Get available transitions for {jira_key}"
+                })
+                enhanced_actions.append({
+                    "service": "jira",
+                    "action": "transition_issue",
+                    "args": {"issue_key": jira_key, "target_state": new_state},
+                    "description": f"Move {jira_key} to {new_state}"
+                })
+                continue
 
         enhanced_actions.append(action)
 
@@ -645,6 +830,19 @@ def propose_actions(
         raise LLMPlanningError("OpenAI key is required")
 
     start_time = time.time()
+
+    # Check for greeting first
+    if _is_greeting(user_message):
+        return {
+            "message": "Hi! I'm ready to help. I can list GitHub/Jira issues, show details, create issues/PRs, update statuses, etc.",
+            "actions": [],
+            "metadata": {
+                "execution_time": time.time() - start_time,
+                "model": model,
+                "attempts": 1,
+                "greeting": True
+            }
+        }
 
     # Extract repository info if not provided
     if not (gh_owner and gh_repo):
@@ -791,6 +989,7 @@ def clear_caches():
     _extract_owner_repo.cache_clear()
     _extract_issue_number.cache_clear()
     _extract_jira_key.cache_clear()
+    _extract_issue_title.cache_clear()
     _infer_platform_intent.cache_clear()
     _build_optimized_system_prompt.cache_clear()
     _openai_clients.clear()
@@ -803,6 +1002,7 @@ def get_cache_stats():
         "extract_owner_repo": _extract_owner_repo.cache_info()._asdict(),
         "extract_issue_number": _extract_issue_number.cache_info()._asdict(),
         "extract_jira_key": _extract_jira_key.cache_info()._asdict(),
+        "extract_issue_title": _extract_issue_title.cache_info()._asdict(),
         "platform_intent": _infer_platform_intent.cache_info()._asdict(),
         "system_prompts": _build_optimized_system_prompt.cache_info()._asdict(),
         "openai_clients": len(_openai_clients)

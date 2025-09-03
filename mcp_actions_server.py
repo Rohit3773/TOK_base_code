@@ -1348,6 +1348,7 @@ def cleanup():
     executor.shutdown(wait=True)
 
 
+
 if __name__ == "__main__":
     log.info("Starting optimized MCP server with GitHub, Jira, and Notion support (stdio)...")
     try:

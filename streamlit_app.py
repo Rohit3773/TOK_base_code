@@ -1,8 +1,8 @@
-# streamlit_app.py
 import streamlit as st
 import json
 import time
 import logging
+import base64
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 import traceback
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Import modules with comprehensive error handling
 try:
-    from github_client import GitHubClient, GitHubError, GitHubConfig
+    from github_client import GitHubClient, GitHubError, GitHubConfig, normalize_issue_pr_input
     from jira_client import JiraClient, JiraError, JiraConfig
     from notion_client import NotionClient, NotionError, NotionConfig
     from llm_agent import propose_actions, clear_caches, get_cache_stats, performance_monitor
@@ -105,6 +105,17 @@ st.markdown("""
         border-radius: 8px;
         overflow: hidden;
     }
+
+    .error-details {
+        background: #f8d7da;
+        border: 1px solid #f5c6cb;
+        border-radius: 5px;
+        padding: 1rem;
+        margin: 0.5rem 0;
+        font-family: monospace;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -121,7 +132,9 @@ def init_session_state():
         'gh_repo': '',
         'jira_project': '',
         'notion_database_id': '',
-        'current_input': ''
+        'current_input': '',
+        'jira_connection_status': 'Not Connected',
+        'jira_connection_details': {}
     }
 
     for key, value in defaults.items():
@@ -143,7 +156,11 @@ def get_openai_client():
 
 
 def initialize_clients():
-    """Initialize clients with proper error handling."""
+    """
+    Initialize clients with proper error handling and credential validation.
+
+    FIXED: Enhanced Jira connection with better URL validation and error handling.
+    """
     success_messages = []
     error_messages = []
 
@@ -151,18 +168,23 @@ def initialize_clients():
     st.session_state.github_client = None
     st.session_state.jira_client = None
     st.session_state.notion_client = None
+    st.session_state.jira_connection_status = 'Not Connected'
+    st.session_state.jira_connection_details = {}
 
-    # Get values from sidebar
-    openai_key = st.session_state.get('sidebar_openai_key', '')
-    github_token = st.session_state.get('sidebar_github_token', '')
-    gh_owner = st.session_state.get('sidebar_gh_owner', '')
-    gh_repo = st.session_state.get('sidebar_gh_repo', '')
-    jira_url = st.session_state.get('sidebar_jira_url', '')
-    jira_email = st.session_state.get('sidebar_jira_email', '')
-    jira_token = st.session_state.get('sidebar_jira_token', '')
-    jira_project = st.session_state.get('sidebar_jira_project', '')
-    notion_token = st.session_state.get('sidebar_notion_token', '')
-    notion_database_id = st.session_state.get('sidebar_notion_database_id', '')
+    # Get values from sidebar - FIXED: Ensure full strings are captured
+    openai_key = st.session_state.get('sidebar_openai_key', '').strip()
+    github_token = st.session_state.get('sidebar_github_token', '').strip()
+    gh_owner = st.session_state.get('sidebar_gh_owner', '').strip()
+    gh_repo = st.session_state.get('sidebar_gh_repo', '').strip()
+
+    # FIXED: Enhanced Jira URL validation and normalization
+    jira_url = st.session_state.get('sidebar_jira_url', '').strip()
+    jira_email = st.session_state.get('sidebar_jira_email', '').strip()
+    jira_token = st.session_state.get('sidebar_jira_token', '').strip()
+    jira_project = st.session_state.get('sidebar_jira_project', '').strip()
+
+    notion_token = st.session_state.get('sidebar_notion_token', '').strip()
+    notion_database_id = st.session_state.get('sidebar_notion_database_id', '').strip()
 
     # Update session state
     st.session_state.openai_key = openai_key
@@ -181,19 +203,140 @@ def initialize_clients():
             st.session_state.github_client = client
             success_messages.append(f"GitHub: Connected as {user_info.get('login')}")
         except Exception as e:
-            error_messages.append(f"GitHub: {str(e)[:100]}")
+            error_messages.append(f"GitHub: {str(e)[:200]}")
 
-    # Initialize Jira client
+    # Initialize Jira client - FIXED: Enhanced validation and error handling
     if jira_url and jira_email and jira_token:
         try:
-            config = JiraConfig(enable_caching=True, max_retries=3, timeout=30)
+            # FIXED: Comprehensive URL validation and normalization
+            original_url = jira_url
+
+            # Add protocol if missing
+            if not jira_url.startswith(('http://', 'https://')):
+                jira_url = f'https://{jira_url}'
+
+            # Handle common URL completion issues
+            if 'atlassian' in jira_url and not jira_url.endswith('.net'):
+                if jira_url.endswith('.atlassian.n'):
+                    jira_url = jira_url + 'et'
+                elif jira_url.endswith('.atlassian'):
+                    jira_url = jira_url + '.net'
+                elif jira_url.endswith('.'):
+                    jira_url = jira_url + 'net'
+
+            # Remove any trailing slash
+            jira_url = jira_url.rstrip('/')
+
+            # Store connection details for debugging
+            st.session_state.jira_connection_details = {
+                'original_url': original_url,
+                'normalized_url': jira_url,
+                'email': jira_email,
+                'token_length': len(jira_token),
+                'timestamp': datetime.now().isoformat()
+            }
+
+            # Log for debugging (without sensitive data)
+            logger.info(f"Initializing Jira client:")
+            logger.info(f"  Original URL: {original_url}")
+            logger.info(f"  Normalized URL: {jira_url}")
+            logger.info(f"  Email: {jira_email}")
+            logger.info(f"  Token length: {len(jira_token)}")
+
+            # Create Jira client with enhanced config
+            config = JiraConfig(
+                enable_caching=True,
+                max_retries=3,
+                timeout=30,
+                verify_ssl=True  # Start with SSL verification
+            )
+
+            # Create client - this will test connection automatically
             client = JiraClient(jira_url, jira_email, jira_token, config)
-            # Test connection
+
+            # If we get here, connection was successful
             user_info = client.whoami()
             st.session_state.jira_client = client
-            success_messages.append(f"Jira: Connected as {user_info.get('displayName')}")
+            st.session_state.jira_connection_status = 'Connected'
+
+            display_name = user_info.get('displayName', 'User')
+            email_address = user_info.get('emailAddress', jira_email)
+
+            success_messages.append(f"Jira: Connected as {display_name} ({email_address})")
+
         except Exception as e:
-            error_messages.append(f"Jira: {str(e)[:100]}")
+            # FIXED: Comprehensive error handling without truncation
+            error_str = str(e)
+            st.session_state.jira_connection_status = 'Failed'
+
+            # Create detailed error information
+            error_details = {
+                'error_type': type(e).__name__,
+                'error_message': error_str,
+                'url_used': jira_url,
+                'troubleshooting': []
+            }
+
+            # Provide specific troubleshooting guidance
+            if "Authentication failed" in error_str or "401" in error_str:
+                error_details['troubleshooting'] = [
+                    "1. Verify your Jira URL format: https://yourcompany.atlassian.net",
+                    "2. Check your email address (must match Atlassian account)",
+                    "3. Generate a new API token at: https://id.atlassian.com/manage-profile/security/api-tokens",
+                    "4. Ensure your account has API access enabled"
+                ]
+                error_title = "Jira Authentication Failed"
+
+            elif "Connection" in error_str or "timeout" in error_str.lower():
+                error_details['troubleshooting'] = [
+                    "1. Check your internet connection",
+                    "2. Verify the Jira URL is accessible in your browser",
+                    "3. Check if you're behind a corporate firewall",
+                    "4. Try accessing Jira directly to confirm it's working"
+                ]
+                error_title = "Jira Connection Failed"
+
+            elif "SSL" in error_str:
+                error_details['troubleshooting'] = [
+                    "1. SSL certificate issue detected",
+                    "2. This may be due to corporate network security",
+                    "3. Try accessing Jira in your browser first",
+                    "4. Contact your IT administrator if the issue persists"
+                ]
+                error_title = "Jira SSL Error"
+
+            else:
+                error_details['troubleshooting'] = [
+                    "1. Double-check all credentials",
+                    "2. Ensure Jira is accessible via browser",
+                    "3. Try generating a new API token",
+                    "4. Contact your Jira administrator for assistance"
+                ]
+                error_title = "Jira Connection Error"
+
+            # Display comprehensive error message
+            error_msg = f"""
+{error_title}
+
+Connection Details:
+• URL: {jira_url}
+• Email: {jira_email}
+• Token: {'*' * (len(jira_token) - 4)}{jira_token[-4:] if len(jira_token) > 4 else '****'}
+
+Error: {error_str}
+
+Troubleshooting Steps:
+{chr(10).join(error_details['troubleshooting'])}
+            """.strip()
+
+            error_messages.append(error_msg)
+            logger.error(f"Jira client initialization failed: {error_str}")
+
+            # Store error details for debugging
+            st.session_state.jira_connection_details.update({
+                'error': error_details,
+                'status': 'Failed'
+            })
 
     # Initialize Notion client
     if notion_token:
@@ -205,17 +348,95 @@ def initialize_clients():
             st.session_state.notion_client = client
             success_messages.append(f"Notion: Connected as {bot_info.get('name', 'Bot')}")
         except Exception as e:
-            error_messages.append(f"Notion: {str(e)[:100]}")
+            error_messages.append(f"Notion: {str(e)[:200]}")
 
-    # Display results
+    # Display results with enhanced formatting
     if success_messages:
         st.success("✅ " + " | ".join(success_messages))
+
     if error_messages:
-        st.error("❌ " + " | ".join(error_messages))
+        for error_msg in error_messages:
+            if "Jira" in error_msg and len(error_msg) > 200:
+                # Display Jira errors in expandable section for better readability
+                with st.expander("🔍 Jira Connection Error Details", expanded=True):
+                    st.markdown(f'<div class="error-details">{error_msg}</div>', unsafe_allow_html=True)
+            else:
+                st.error(error_msg)
+
+
+def normalize_github_issue_input(input_str: str) -> Optional[int]:
+    """Normalize GitHub issue input to issue number."""
+    if not input_str:
+        return None
+
+    try:
+        return normalize_issue_pr_input(str(input_str))
+    except ValueError:
+        return None
+
+
+def find_best_jira_transition(transitions: List[Dict], target_state: str) -> Optional[str]:
+    """
+    Find the best matching Jira transition for the target state with improved logic.
+
+    FIXED: Enhanced pattern matching for more reliable transition detection.
+    """
+    if not transitions:
+        return None
+
+    # Normalize target state
+    target_lower = target_state.lower().replace('_', ' ').strip()
+
+    # Remove common prefixes like ":" from target state
+    if target_lower.startswith(':'):
+        target_lower = target_lower[1:]
+
+    # Enhanced state mappings with regex patterns
+    state_patterns = {
+        'done': [
+            r'^(done|close.*|closed.*|resolve.*|resolved.*|complete.*|completed.*)$'
+        ],
+        'closed': [
+            r'^(close.*|closed.*|done|resolve.*|resolved.*|finish.*|finished.*)$'
+        ],
+        'open': [
+            r'^(reopen.*|open|to\s*do.*|backlog.*)$'
+        ],
+        'in_progress': [
+            r'^(in\s*progress.*|start.*|started.*|begin.*|doing.*|active.*)$'
+        ],
+    }
+
+    patterns = state_patterns.get(target_lower, [f'^.*{re.escape(target_lower)}.*$'])
+
+    # Look for pattern matches
+    for pattern in patterns:
+        for transition in transitions:
+            transition_name = transition.get('name', '').lower()
+            if re.match(pattern, transition_name):
+                return transition.get('id')
+
+    # Fallback: look for partial matches (more flexible)
+    for transition in transitions:
+        transition_name = transition.get('name', '').lower()
+        if target_lower in transition_name or transition_name in target_lower:
+            return transition.get('id')
+
+    # Last resort: look for exact matches ignoring case
+    for transition in transitions:
+        transition_name = transition.get('name', '').lower()
+        if transition_name == target_lower:
+            return transition.get('id')
+
+    return None
 
 
 def execute_github_action(client, tool: str, args: dict) -> dict:
-    """Execute GitHub action."""
+    """
+    Execute GitHub action with proper argument mapping and normalization.
+
+    FIXED: Improved parameter handling and error recovery for all GitHub operations.
+    """
     try:
         # Add default owner/repo if not provided
         if 'owner' not in args and st.session_state.gh_owner:
@@ -227,36 +448,93 @@ def execute_github_action(client, tool: str, args: dict) -> dict:
         if tool.startswith('gh_'):
             tool = tool[3:]
 
-        # Handle parameter mapping for GitHub
-        if tool == 'create_issue':
-            # Map common parameter names
-            if 'content' in args:
-                args['body'] = args.pop('content')
+        # Normalize issue numbers in arguments
+        if 'issue_number' in args:
+            if isinstance(args['issue_number'], str):
+                normalized_num = normalize_github_issue_input(args['issue_number'])
+                if normalized_num:
+                    args['issue_number'] = normalized_num
+                else:
+                    return {'error': f'Invalid issue number: {args["issue_number"]}'}
 
-            # Clean up parameters - only keep valid GitHub API parameters
+        # Parameter cleaning and validation based on action
+        if tool == 'create_issue':
             valid_params = {'owner', 'repo', 'title', 'body', 'assignees', 'milestone', 'labels'}
             cleaned_args = {k: v for k, v in args.items() if k in valid_params}
             args = cleaned_args
 
-        elif tool == 'create_pull_request':
-            # Map common parameter names
-            if 'content' in args:
-                args['body'] = args.pop('content')
+        elif tool == 'update_issue':
+            valid_params = {'owner', 'repo', 'issue_number', 'title', 'body', 'state', 'assignees', 'labels'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
 
-            valid_params = {'owner', 'repo', 'title', 'body', 'head', 'base', 'draft'}
+        elif tool == 'get_issue':
+            valid_params = {'owner', 'repo', 'issue_number'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
+
+        elif tool == 'add_issue_comment':
+            valid_params = {'owner', 'repo', 'issue_number', 'body'}
             cleaned_args = {k: v for k, v in args.items() if k in valid_params}
             args = cleaned_args
 
         elif tool == 'search_issues':
-            # Ensure query parameter is present
             if 'query' not in args:
                 return {'error': 'GitHub search_issues requires query parameter'}
+            valid_params = {'query', 'sort', 'order', 'per_page', 'page'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
 
         elif tool == 'search_pull_requests':
-            # Ensure query parameter is present
             if 'query' not in args:
                 return {'error': 'GitHub search_pull_requests requires query parameter'}
+            valid_params = {'query', 'sort', 'order', 'per_page', 'page'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
 
+        elif tool == 'create_pull_request':
+            # FIXED: Enhanced validation for pull request creation
+            required_params = ['title', 'head', 'base']
+            for param in required_params:
+                if param not in args:
+                    return {'error': f'create_pull_request requires {param} parameter'}
+
+            valid_params = {'owner', 'repo', 'title', 'body', 'head', 'base', 'draft', 'maintainer_can_modify'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
+
+        elif tool == 'get_file_contents':
+            # FIXED: Ensure both path and ref are present with better defaults
+            if 'path' not in args:
+                return {'error': 'get_file_contents requires path parameter'}
+            if 'ref' not in args:
+                args['ref'] = 'main'  # default to main branch
+            valid_params = {'owner', 'repo', 'path', 'ref'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
+
+        elif tool == 'create_or_update_file':
+            valid_params = {'owner', 'repo', 'path', 'content', 'message', 'branch'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
+
+        elif tool == 'create_branch':
+            valid_params = {'owner', 'repo', 'branch', 'from_branch'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
+
+        # FIXED: Added parameter cleaning for list_branches and list_tags
+        elif tool == 'list_branches':
+            valid_params = {'owner', 'repo', 'protected', 'per_page', 'page'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
+
+        elif tool == 'list_tags':
+            valid_params = {'owner', 'repo', 'per_page', 'page'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
+
+        # Comprehensive action mapping to client methods
         action_map = {
             # Issues
             'create_issue': lambda: client.create_issue(**args),
@@ -350,42 +628,12 @@ def execute_github_action(client, tool: str, args: dict) -> dict:
         return {'error': str(e)}
 
 
-def find_best_jira_transition(transitions: List[Dict], target_state: str) -> Optional[str]:
-    """Find the best matching Jira transition for the target state."""
-    if not transitions:
-        return None
-
-    # Normalize target state
-    target_lower = target_state.lower()
-
-    # Priority order for different states
-    state_mappings = {
-        'done': ['done', 'close', 'closed', 'resolve', 'resolved', 'complete', 'completed'],
-        'closed': ['close', 'closed', 'done', 'resolve', 'resolved'],
-        'open': ['reopen', 'open', 'start', 'in progress', 'to do'],
-    }
-
-    search_terms = state_mappings.get(target_lower, [target_lower])
-
-    # Look for exact matches first
-    for term in search_terms:
-        for transition in transitions:
-            transition_name = transition.get('name', '').lower()
-            if term == transition_name:
-                return transition.get('id')
-
-    # Look for partial matches
-    for term in search_terms:
-        for transition in transitions:
-            transition_name = transition.get('name', '').lower()
-            if term in transition_name or transition_name in term:
-                return transition.get('id')
-
-    return None
-
-
 def execute_jira_action(client, tool: str, args: dict) -> dict:
-    """Execute Jira action."""
+    """
+    Execute Jira action with improved parameter handling and transition logic.
+
+    FIXED: Enhanced Jira transition handling with better state matching and error recovery.
+    """
     try:
         if tool.startswith('jira_'):
             tool = tool[5:]
@@ -408,13 +656,8 @@ def execute_jira_action(client, tool: str, args: dict) -> dict:
             if 'project_key' not in args and st.session_state.jira_project:
                 args['project_key'] = st.session_state.jira_project
 
-            # Remove issue_type - let the client use its defaults
-            if 'issue_type' in args:
-                args.pop('issue_type')
-
-            # Clean up any other parameters that might cause issues
-            # Only keep the core parameters that Jira create_issue expects
-            valid_params = {'project_key', 'summary', 'description', 'priority', 'assignee', 'labels'}
+            # Clean up parameters
+            valid_params = {'project_key', 'summary', 'description', 'priority', 'assignee', 'labels', 'issuetype_name'}
             cleaned_args = {k: v for k, v in args.items() if k in valid_params}
             args = cleaned_args
 
@@ -422,24 +665,45 @@ def execute_jira_action(client, tool: str, args: dict) -> dict:
             args['jql'] = f'project = "{st.session_state.jira_project}" ORDER BY created DESC'
 
         elif tool == 'transition_issue':
-            # Handle smart transition resolution
+            # FIXED: Enhanced smart transition resolution using enhanced client methods
             if 'target_state' in args:
                 target_state = args.pop('target_state')
                 issue_key = args.get('issue_key')
 
                 if issue_key:
-                    # Get available transitions
-                    transitions_result = client.list_transitions(issue_key)
-                    transitions = transitions_result.get('transitions', [])
+                    try:
+                        # Use the enhanced transition_to_status method from the new client if available
+                        if hasattr(client, 'transition_to_status'):
+                            # Use the new enhanced method
+                            result = client.transition_to_status(issue_key, target_state)
+                            return {'success': True, 'data': result}
+                        else:
+                            # Fallback to the improved transition handling
+                            if hasattr(client, 'find_transition_by_name'):
+                                transition_id = client.find_transition_by_name(issue_key, target_state)
+                            else:
+                                # Use local fallback method
+                                transitions_result = client.list_transitions(issue_key)
+                                transitions = transitions_result.get('transitions', [])
+                                transition_id = find_best_jira_transition(transitions, target_state)
 
-                    # Find best matching transition
-                    transition_id = find_best_jira_transition(transitions, target_state)
+                            if transition_id:
+                                args['transition_id'] = transition_id
+                            else:
+                                # Get available transitions for error message
+                                transitions_result = client.list_transitions(issue_key)
+                                available = [t.get('name', 'Unknown') for t in
+                                             transitions_result.get('transitions', [])]
+                                logger.warning(f"No transition found for '{target_state}'. Available: {available}")
+                                return {
+                                    'error': f'No suitable transition found for state "{target_state}". Available transitions: {", ".join(available)}'
+                                }
 
-                    if transition_id:
-                        args['transition_id'] = transition_id
-                    else:
-                        return {'error': f'No suitable transition found for state "{target_state}"'}
+                    except Exception as e:
+                        logger.error(f"Failed to transition {issue_key}: {e}")
+                        return {'error': f'Failed to transition issue: {str(e)}'}
 
+        # Action mapping
         action_map = {
             'create_issue': lambda: client.create_issue(**args),
             'search': lambda: client.search(**args),
@@ -455,15 +719,23 @@ def execute_jira_action(client, tool: str, args: dict) -> dict:
             return {'error': f'Unknown Jira action: {tool}'}
 
         result = action()
-        if tool == 'search' and isinstance(result, dict) and 'issues' in result:
-            return {'success': True, 'data': result['issues']}
+
+        # FIXED: Improved result handling to ensure consistent format
+        if tool == 'search':
+            if isinstance(result, dict) and 'issues' in result:
+                return {'success': True, 'data': result['issues']}
+            elif isinstance(result, list):
+                return {'success': True, 'data': result}
+
         return {'success': True, 'data': result}
+
     except Exception as e:
+        logger.error(f"Jira action {tool} failed: {e}")
         return {'error': str(e)}
 
 
 def execute_notion_action(client, tool: str, args: dict) -> dict:
-    """Execute Notion action."""
+    """Execute Notion action with preserved functionality."""
     try:
         if tool.startswith('notion_'):
             tool = tool[7:]
@@ -496,13 +768,12 @@ def execute_notion_action(client, tool: str, args: dict) -> dict:
                             formatted_props[key] = value
                     args['properties'] = formatted_props
 
-            # Clean up parameters - only keep valid Notion API parameters
+            # Clean up parameters
             valid_params = {'parent', 'properties', 'children', 'icon', 'cover'}
             cleaned_args = {k: v for k, v in args.items() if k in valid_params}
             args = cleaned_args
 
         elif tool == 'query_database':
-            # Clean parameters for database queries
             valid_params = {'database_id', 'filter', 'sorts', 'start_cursor', 'page_size'}
             cleaned_args = {k: v for k, v in args.items() if k in valid_params}
             args = cleaned_args
@@ -538,6 +809,9 @@ def get_ai_response_with_actions(user_message: str, model: str) -> Dict[str, Any
         return {'error': 'OpenAI API key not configured'}
 
     try:
+        # FIXED: Ensure Jira project key is properly passed
+        jira_project = st.session_state.get('jira_project', '').strip()
+
         # Use the improved propose_actions function
         result = propose_actions(
             openai_key=st.session_state.openai_key,
@@ -545,7 +819,7 @@ def get_ai_response_with_actions(user_message: str, model: str) -> Dict[str, Any
             user_message=user_message,
             gh_owner=st.session_state.gh_owner,
             gh_repo=st.session_state.gh_repo,
-            jira_project_key=st.session_state.jira_project,
+            jira_project_key=jira_project,
             notion_database_id=st.session_state.notion_database_id
         )
 
@@ -560,7 +834,11 @@ def get_ai_response_with_actions(user_message: str, model: str) -> Dict[str, Any
 
 
 def execute_actions(actions: List[Dict]) -> List[Dict]:
-    """Execute actions and return results."""
+    """
+    Execute actions and return results with enhanced tracking.
+
+    FIXED: Improved error handling and result consistency across all platforms.
+    """
     results = []
 
     for i, action in enumerate(actions):
@@ -579,18 +857,36 @@ def execute_actions(actions: List[Dict]) -> List[Dict]:
             else:
                 result = {'error': f'{service} client not available'}
 
+            # Enhanced result logging for debugging
+            if 'success' in result and result['success']:
+                logger.info(f"Action {service}.{action_name} succeeded. Data type: {type(result.get('data'))}")
+                if isinstance(result.get('data'), dict):
+                    logger.info(f"Data keys: {list(result.get('data', {}).keys())}")
+                elif isinstance(result.get('data'), list) and result.get('data'):
+                    logger.info(f"Data list length: {len(result['data'])}")
+                    if result['data']:
+                        logger.info(
+                            f"First item keys: {list(result['data'][0].keys()) if isinstance(result['data'][0], dict) else 'Not dict'}")
+            else:
+                logger.warning(f"Action {service}.{action_name} failed: {result.get('error', 'Unknown error')}")
+
             results.append({
                 'action': description,
                 'service': service,
+                'raw_action': action_name,
+                'raw_args': args,
                 'success': 'success' in result,
                 'result': result,
                 'index': i
             })
 
         except Exception as e:
+            logger.error(f"Action {service}.{action_name} failed with exception: {e}")
             results.append({
                 'action': description,
                 'service': service,
+                'raw_action': action_name,
+                'raw_args': args,
                 'success': False,
                 'result': {'error': str(e)},
                 'index': i
@@ -604,7 +900,7 @@ def create_github_issues_dataframe(issues_data: List[Dict]) -> pd.DataFrame:
     if not issues_data:
         return pd.DataFrame()
 
-    # Prepare data for DataFrame - same columns as before
+    # Prepare data for DataFrame
     table_data = []
     for issue in issues_data:
         if isinstance(issue, dict):
@@ -613,6 +909,9 @@ def create_github_issues_dataframe(issues_data: List[Dict]) -> pd.DataFrame:
             state = issue.get('state', 'unknown').upper()
             created_at = issue.get('created_at', '')
             assignee = 'Unassigned'
+
+            # Get the HTML URL for clickable links
+            html_url = issue.get('html_url', '')
 
             # Format date
             if created_at:
@@ -634,20 +933,26 @@ def create_github_issues_dataframe(issues_data: List[Dict]) -> pd.DataFrame:
                 labels = [label.get('name', '') for label in issue['labels'][:3]]
             labels_str = ', '.join(labels) if labels else '-'
 
+            # Create clickable number with link
+            number_display = f"#{number}"
+            if html_url:
+                number_display = f'<a href="{html_url}" target="_blank">#{number}</a>'
+
             table_data.append({
-                'Number': f"#{number}",
+                'Number': number_display,
                 'Title': title,
                 'State': state,
                 'Created': created_at,
                 'Assignee': assignee,
-                'Labels': labels_str
+                'Labels': labels_str,
+                'URL': html_url  # Keep URL for external use
             })
 
     return pd.DataFrame(table_data)
 
 
 def create_jira_issues_dataframe(issues_data: List[Dict]) -> pd.DataFrame:
-    """Create a pandas DataFrame for Jira issues with bulletproof data extraction."""
+    """Create a pandas DataFrame for Jira issues with improved robustness."""
     if not issues_data:
         return pd.DataFrame()
 
@@ -660,7 +965,7 @@ def create_jira_issues_dataframe(issues_data: List[Dict]) -> pd.DataFrame:
             # Extract fields with multiple fallbacks
             fields = issue.get('fields', {})
 
-            # Summary extraction with fallbacks
+            # Summary extraction with comprehensive fallbacks
             summary = None
             summary_candidates = [
                 fields.get('summary'),
@@ -679,7 +984,6 @@ def create_jira_issues_dataframe(issues_data: List[Dict]) -> pd.DataFrame:
 
             if not summary:
                 summary = 'No title'
-                logger.debug(f"No summary found for {key}")
 
             # Status extraction with fallbacks
             status = 'Unknown'
@@ -755,14 +1059,26 @@ def create_jira_issues_dataframe(issues_data: List[Dict]) -> pd.DataFrame:
                         if len(created) >= 8:  # Reasonable date length
                             break
 
+            # Generate Jira URL if we have the Jira base URL
+            jira_url = ""
+            if st.session_state.get('jira_client') and hasattr(st.session_state.jira_client, 'base'):
+                jira_base = st.session_state.jira_client.base
+                jira_url = f"{jira_base}/browse/{key}"
+
+            # Create clickable key with link
+            key_display = key
+            if jira_url:
+                key_display = f'<a href="{jira_url}" target="_blank">{key}</a>'
+
             table_data.append({
-                'Key': key,
+                'Key': key_display,
                 'Summary': summary,
                 'Status': status,
                 'Type': issue_type,
                 'Priority': priority,
                 'Created': created,
-                'Assignee': assignee
+                'Assignee': assignee,
+                'URL': jira_url  # Keep URL for external use
             })
 
     return pd.DataFrame(table_data)
@@ -811,7 +1127,12 @@ def create_notion_pages_dataframe(pages_data: List[Dict]) -> pd.DataFrame:
 
 
 def format_execution_results_with_tables(results: List[Dict]) -> Tuple[str, List[pd.DataFrame], List[str]]:
-    """Format results for display - return text summary, DataFrames, and table titles."""
+    """
+    Format results for display with accurate success messages matching the actual operations.
+
+    FIXED: Enhanced result formatting with better handling of all GitHub/Jira operations
+    and improved error messaging for failed searches.
+    """
     if not results:
         return "", [], []
 
@@ -823,73 +1144,391 @@ def format_execution_results_with_tables(results: List[Dict]) -> Tuple[str, List
         action = result['action']
         success = result['success']
         service = result.get('service', '').title()
+        raw_action = result.get('raw_action', '')
+        raw_args = result.get('raw_args', {})
 
         if success:
             data = result['result'].get('data', {})
 
-            if isinstance(data, dict):
-                if 'number' in data:  # GitHub issue/PR created
-                    summary_parts.append(f"✅ {service}: Issue #{data['number']} created")
-                    if 'html_url' in data:
-                        summary_parts.append(f"   🔗 {data['html_url']}")
-                elif 'key' in data:  # Jira issue created
-                    summary_parts.append(f"✅ {service}: {data['key']} created")
-                elif 'displayName' in data:  # Jira user info
-                    summary_parts.append(f"✅ {service}: User - {data['displayName']}")
-                elif 'name' in data and service == 'Notion':  # Notion bot
-                    summary_parts.append(f"✅ {service}: Bot - {data['name']}")
-                else:
-                    summary_parts.append(f"✅ {service}: {action} completed")
+            # GitHub actions with accurate messaging
+            if service.lower() == 'github':
+                if raw_action == 'create_issue':
+                    if isinstance(data, dict) and 'number' in data:
+                        html_url = data.get('html_url', '')
+                        summary_parts.append(f"GitHub: Issue #{data['number']} created")
+                        if html_url:
+                            summary_parts.append(f"   Link: {html_url}")
 
-            elif isinstance(data, list):  # List results
-                summary_parts.append(f"✅ {service}: Found {len(data)} items")
-
-                # Create DataFrames for different services
-                if service.lower() == 'github' and data:
-                    # Check if this looks like issues (has number and title)
-                    if any('number' in item and 'title' in item for item in data[:3] if isinstance(item, dict)):
-                        df = create_github_issues_dataframe(data)
+                elif raw_action == 'get_issue':
+                    issue_num = raw_args.get('issue_number', 'N/A')
+                    summary_parts.append(f"GitHub: Issue #{issue_num} details")
+                    # Add to dataframe for display
+                    if isinstance(data, dict):
+                        df = create_github_issues_dataframe([data])
                         if not df.empty:
                             dataframes.append(df)
                             table_titles.append("GitHub Issues")
-                    else:
-                        # Handle other GitHub list data generically
-                        generic_data = []
-                        for item in data[:50]:  # Limit to 50 items
-                            if isinstance(item, dict):
-                                row = {}
-                                if 'name' in item:
-                                    row['Name'] = item['name']
-                                if 'login' in item:
-                                    row['Login'] = item['login']
-                                if 'created_at' in item:
-                                    row['Created'] = item['created_at'][:10]
-                                if row:  # Only add if we extracted some data
-                                    generic_data.append(row)
 
-                        if generic_data:
-                            df = pd.DataFrame(generic_data)
+                elif raw_action == 'update_issue':
+                    issue_num = raw_args.get('issue_number', 'N/A')
+                    state = raw_args.get('state', '')
+                    html_url = ''
+                    if isinstance(data, dict) and 'html_url' in data:
+                        html_url = data['html_url']
+                    elif st.session_state.gh_owner and st.session_state.gh_repo:
+                        html_url = f"https://github.com/{st.session_state.gh_owner}/{st.session_state.gh_repo}/issues/{issue_num}"
+
+                    if state == 'closed':
+                        summary_parts.append(f"GitHub: Issue #{issue_num} closed")
+                    elif state == 'open':
+                        summary_parts.append(f"GitHub: Issue #{issue_num} reopened")
+                    else:
+                        summary_parts.append(f"GitHub: Issue #{issue_num} updated")
+
+                    if html_url:
+                        summary_parts.append(f"   Link: {html_url}")
+
+                elif raw_action == 'add_issue_comment':
+                    issue_num = raw_args.get('issue_number', 'N/A')
+                    comment_url = ''
+                    if isinstance(data, dict) and 'html_url' in data:
+                        comment_url = data['html_url']
+                    elif st.session_state.gh_owner and st.session_state.gh_repo:
+                        comment_url = f"https://github.com/{st.session_state.gh_owner}/{st.session_state.gh_repo}/issues/{issue_num}"
+
+                    summary_parts.append(f"GitHub: Comment added to #{issue_num}")
+                    if comment_url:
+                        summary_parts.append(f"   Link: {comment_url}")
+
+                elif raw_action == 'create_branch':
+                    branch = raw_args.get('branch', 'N/A')
+                    from_branch = raw_args.get('from_branch', 'main')
+                    summary_parts.append(f"GitHub: Branch '{branch}' created from '{from_branch}'")
+
+                elif raw_action == 'get_file_contents':
+                    # FIXED: Enhanced file content display with proper preview
+                    path = raw_args.get('path', 'N/A')
+                    ref = raw_args.get('ref', 'main')
+                    summary_parts.append(f"GitHub: Retrieved {path} (ref={ref})")
+
+                    # Show file preview
+                    if isinstance(data, dict) and 'content' in data:
+                        try:
+                            content = base64.b64decode(data['content']).decode('utf-8')
+                            # Show more content for better visibility
+                            preview = content[:500] + "..." if len(content) > 500 else content
+                            summary_parts.append(f"   File Content:\n```\n{preview}\n```")
+
+                            # Also show file size and type
+                            summary_parts.append(f"   Size: {data.get('size', 'Unknown')} bytes")
+
+                        except Exception as e:
+                            summary_parts.append(f"   Binary file or decode error: {str(e)}")
+                            if 'download_url' in data:
+                                summary_parts.append(f"   Download: {data['download_url']}")
+
+                elif raw_action == 'create_or_update_file':
+                    path = raw_args.get('path', 'N/A')
+                    branch = raw_args.get('branch', 'main')
+                    summary_parts.append(f"GitHub: File {path} updated on {branch}")
+
+                elif raw_action == 'create_pull_request':
+                    # FIXED: Enhanced PR creation success message
+                    if isinstance(data, dict) and 'number' in data:
+                        html_url = data.get('html_url', '')
+                        title = data.get('title', 'N/A')
+                        head = data.get('head', {}).get('ref', 'N/A')
+                        base = data.get('base', {}).get('ref', 'N/A')
+
+                        summary_parts.append(f"GitHub: PR #{data['number']} created")
+                        summary_parts.append(f"   Title: {title}")
+                        summary_parts.append(f"   Changes: {head} → {base}")
+                        if html_url:
+                            summary_parts.append(f"   Link: {html_url}")
+
+                elif raw_action == 'list_branches':
+                    # FIXED: Enhanced branch listing with better formatting
+                    if isinstance(data, list):
+                        summary_parts.append(f"GitHub: Found {len(data)} branches")
+
+                        # Show branch list with protection status
+                        branch_info = []
+                        for branch in data[:10]:  # Show first 10
+                            name = branch.get('name', 'Unknown')
+                            protected = ' (protected)' if branch.get('protected', False) else ''
+                            branch_info.append(f"• {name}{protected}")
+
+                        if branch_info:
+                            branch_list = '\n'.join(branch_info)
+                            if len(data) > 10:
+                                branch_list += f"\n... and {len(data) - 10} more"
+                            summary_parts.append(f"\nBranches:\n{branch_list}")
+                    else:
+                        summary_parts.append(f"GitHub: Branch list retrieved")
+
+                elif raw_action == 'list_tags':
+                    # FIXED: Enhanced tag listing with better formatting
+                    if isinstance(data, list):
+                        summary_parts.append(f"GitHub: Found {len(data)} tags")
+
+                        if len(data) == 0:
+                            summary_parts.append("   No tags found in this repository")
+                        else:
+                            # Show tag list with commit info
+                            tag_info = []
+                            for tag in data[:10]:  # Show first 10
+                                name = tag.get('name', 'Unknown')
+                                commit_sha = tag.get('commit', {}).get('sha', '')[:7] if tag.get('commit') else ''
+                                commit_info = f' ({commit_sha})' if commit_sha else ''
+                                tag_info.append(f"• {name}{commit_info}")
+
+                            if tag_info:
+                                tag_list = '\n'.join(tag_info)
+                                if len(data) > 10:
+                                    tag_list += f"\n... and {len(data) - 10} more"
+                                summary_parts.append(f"\nTags:\n{tag_list}")
+                    else:
+                        summary_parts.append(f"GitHub: Tag list retrieved")
+
+                elif raw_action == 'search_issues':
+                    # FIXED: Enhanced search results handling with proper "not found" messaging
+                    if isinstance(data, dict):
+                        # Handle GitHub search API response format
+                        items = data.get('items', [])
+                        total_count = data.get('total_count', len(items))
+
+                        if total_count == 0 or len(items) == 0:
+                            # FIXED: Proper "not found" message for empty search results
+                            query = raw_args.get('query', '')
+                            summary_parts.append(f"GitHub: Search completed - no issues found")
+                            summary_parts.append(f"   Query: {query}")
+                            summary_parts.append("   No issues matched your search criteria")
+                        else:
+                            summary_parts.append(f"GitHub: Found {total_count} issues")
+                            if items:
+                                df = create_github_issues_dataframe(items)
+                                if not df.empty:
+                                    dataframes.append(df)
+                                    table_titles.append("GitHub Issues")
+
+                                # Add quick summary of top results
+                                issue_titles = [item.get('title', 'No title')[:50] for item in items[:3]]
+                                if len(items) > 3:
+                                    summary_parts.append(
+                                        f"   Top results: {', '.join(issue_titles)}... and {len(items) - 3} more")
+                                else:
+                                    summary_parts.append(f"   Results: {', '.join(issue_titles)}")
+                    else:
+                        # Handle other response formats
+                        summary_parts.append(f"GitHub: Search completed")
+                        if isinstance(data, list):
+                            if len(data) == 0:
+                                summary_parts.append("   No issues found matching your criteria")
+                            else:
+                                df = create_github_issues_dataframe(data)
+                                if not df.empty:
+                                    dataframes.append(df)
+                                    table_titles.append("GitHub Issues")
+
+                elif raw_action == 'list_issues':
+                    # Handle list results (preserve existing functionality)
+                    if isinstance(data, list):
+                        summary_parts.append(f"GitHub: Found {len(data)} issues")
+                        if data:
+                            df = create_github_issues_dataframe(data)
                             if not df.empty:
                                 dataframes.append(df)
-                                table_titles.append(f"GitHub {action.title()}")
+                                table_titles.append("GitHub Issues")
+                                # Show quick summary in chat
+                                open_count = sum(1 for issue in data if issue.get('state', '').lower() == 'open')
+                                closed_count = len(data) - open_count
+                                summary_parts.append(f"   Summary: {open_count} open, {closed_count} closed")
+                    else:
+                        summary_parts.append(f"GitHub: Issues retrieved")
+                        # Try to extract issues data anyway
+                        if data:
+                            try_data = [data] if isinstance(data, dict) else data
+                            df = create_github_issues_dataframe(try_data)
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append("GitHub Issues")
 
-                elif service.lower() == 'jira' and data:
-                    df = create_jira_issues_dataframe(data)
-                    if not df.empty:
-                        dataframes.append(df)
-                        table_titles.append("Jira Issues")
+                else:
+                    summary_parts.append(f"GitHub: {action} completed")
+                    # Try to display any issues data even for unknown actions
+                    if isinstance(data, list) and data:
+                        # Check if it looks like issues data
+                        first_item = data[0] if data else {}
+                        if isinstance(first_item, dict) and ('number' in first_item or 'title' in first_item):
+                            df = create_github_issues_dataframe(data)
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append("GitHub Issues")
+                    elif isinstance(data, dict):
+                        # Check if it's a single issue
+                        if 'number' in data and 'title' in data:
+                            df = create_github_issues_dataframe([data])
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append("GitHub Issues")
 
-                elif service.lower() == 'notion' and data:
-                    df = create_notion_pages_dataframe(data)
-                    if not df.empty:
-                        dataframes.append(df)
-                        table_titles.append("Notion Pages")
+            # Jira actions with accurate messaging
+            elif service.lower() == 'jira':
+                if raw_action == 'create_issue':
+                    if isinstance(data, dict) and 'key' in data:
+                        issue_key = data['key']
+                        summary_parts.append(f"Jira: {issue_key} created")
+                        # Add Jira URL if available
+                        if st.session_state.get('jira_client') and hasattr(st.session_state.jira_client, 'base'):
+                            jira_url = f"{st.session_state.jira_client.base}/browse/{issue_key}"
+                            summary_parts.append(f"   Link: {jira_url}")
+
+                elif raw_action == 'transition_issue':
+                    # FIXED: Enhanced transition success messaging
+                    issue_key = raw_args.get('issue_key', 'N/A')
+                    transition_id = raw_args.get('transition_id', 'N/A')
+
+                    # Try to get the transition name for better messaging
+                    transition_name = "new status"
+                    if isinstance(data, dict) and 'transition' in data:
+                        transition_name = data['transition'].get('name', transition_name)
+
+                    summary_parts.append(f"Jira: {issue_key} transitioned to {transition_name}")
+                    # Add link
+                    if st.session_state.get('jira_client') and hasattr(st.session_state.jira_client, 'base'):
+                        jira_url = f"{st.session_state.jira_client.base}/browse/{issue_key}"
+                        summary_parts.append(f"   Link: {jira_url}")
+
+                elif raw_action == 'add_comment':
+                    issue_key = raw_args.get('issue_key', 'N/A')
+                    summary_parts.append(f"Jira: Comment added to {issue_key}")
+                    # Add link
+                    if st.session_state.get('jira_client') and hasattr(st.session_state.jira_client, 'base'):
+                        jira_url = f"{st.session_state.jira_client.base}/browse/{issue_key}"
+                        summary_parts.append(f"   Link: {jira_url}")
+
+                elif raw_action == 'search':
+                    if isinstance(data, list):
+                        summary_parts.append(f"Jira: Found {len(data)} issues")
+                        if data:
+                            df = create_jira_issues_dataframe(data)
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append("Jira Issues")
+                                # Add status breakdown
+                                status_counts = {}
+                                for issue in data:
+                                    fields = issue.get('fields', {})
+                                    status_obj = fields.get('status', {})
+                                    status = status_obj.get('name', 'Unknown') if isinstance(status_obj, dict) else str(
+                                        status_obj)
+                                    status_counts[status] = status_counts.get(status, 0) + 1
+
+                                status_summary = ', '.join(
+                                    [f"{count} {status}" for status, count in status_counts.items()])
+                                summary_parts.append(f"   Summary: {status_summary}")
+                    else:
+                        summary_parts.append(f"Jira: Search completed")
+                        # Try to extract data anyway
+                        if data:
+                            # Handle case where data might be wrapped in another structure
+                            if isinstance(data, dict) and 'issues' in data:
+                                issues = data['issues']
+                                if issues:
+                                    df = create_jira_issues_dataframe(issues)
+                                    if not df.empty:
+                                        dataframes.append(df)
+                                        table_titles.append("Jira Issues")
+                            elif isinstance(data, dict):
+                                # Single issue result
+                                df = create_jira_issues_dataframe([data])
+                                if not df.empty:
+                                    dataframes.append(df)
+                                    table_titles.append("Jira Issues")
+
+                elif raw_action == 'whoami':
+                    if isinstance(data, dict) and 'displayName' in data:
+                        summary_parts.append(f"Jira: User - {data['displayName']}")
+                    else:
+                        summary_parts.append(f"Jira: User info retrieved")
+
+                else:
+                    summary_parts.append(f"Jira: {action} completed")
+                    # Try to display any Jira data even for unknown actions
+                    if isinstance(data, list) and data:
+                        df = create_jira_issues_dataframe(data)
+                        if not df.empty:
+                            dataframes.append(df)
+                            table_titles.append("Jira Issues")
+                    elif isinstance(data, dict):
+                        if 'issues' in data:
+                            issues = data['issues']
+                            df = create_jira_issues_dataframe(issues)
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append("Jira Issues")
+                        elif 'key' in data and 'fields' in data:
+                            # Single issue
+                            df = create_jira_issues_dataframe([data])
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append("Jira Issues")
+
+            # Notion actions
+            elif service.lower() == 'notion':
+                if isinstance(data, list):
+                    summary_parts.append(f"Notion: Found {len(data)} items")
+                    if data:
+                        df = create_notion_pages_dataframe(data)
+                        if not df.empty:
+                            dataframes.append(df)
+                            table_titles.append("Notion Pages")
+                elif isinstance(data, dict):
+                    if 'name' in data and service == 'Notion':
+                        summary_parts.append(f"Notion: Bot - {data['name']}")
+                    else:
+                        summary_parts.append(f"Notion: {action} completed")
+                else:
+                    summary_parts.append(f"Notion: {action} completed")
+
+        else:
+            # FIXED: Enhanced error message handling with better user-friendly messages
+            error = result['result'].get('error', 'Unknown error')
+            error_str = str(error)
+
+            # Handle specific GitHub API errors more gracefully
+            if service.lower() == 'github':
+                if '422' in error_str and 'Validation Failed' in error_str:
+                    if raw_action == 'create_pull_request':
+                        summary_parts.append(
+                            f"GitHub: Pull request creation failed - check branch names and permissions")
+                    else:
+                        summary_parts.append(f"GitHub: Validation error - check required fields")
+                elif '404' in error_str:
+                    summary_parts.append(f"GitHub: Resource not found - check repository, branch, or file path")
+                elif '403' in error_str:
+                    summary_parts.append(f"GitHub: Permission denied - check token permissions")
+                else:
+                    # Extract first line of error for conciseness
+                    error_line = error_str.split('\n')[0][:150]
+                    summary_parts.append(f"GitHub: {action} failed - {error_line}")
+
+            # Handle Jira errors
+            elif service.lower() == 'jira':
+                if 'transition' in error_str.lower():
+                    summary_parts.append(f"Jira: Status transition failed - {error_str[:100]}")
+                elif '404' in error_str:
+                    summary_parts.append(f"Jira: Issue not found - check issue key")
+                elif '401' in error_str or '403' in error_str:
+                    summary_parts.append(f"Jira: Authentication failed - check credentials")
+                else:
+                    error_line = error_str.split('\n')[0][:150]
+                    summary_parts.append(f"Jira: {action} failed - {error_line}")
 
             else:
-                summary_parts.append(f"✅ {service}: {action} completed")
-        else:
-            error = result['result'].get('error', 'Unknown error')
-            summary_parts.append(f"❌ {service}: {action} failed - {error[:100]}")
+                # Generic error handling
+                error_line = error_str.split('\n')[0][:150]
+                summary_parts.append(f"{service}: {action} failed - {error_line}")
 
     summary_text = "\n".join(summary_parts)
     return summary_text, dataframes, table_titles
@@ -992,7 +1631,27 @@ def display_chat_history():
             for i, df in enumerate(dataframes):
                 title = table_titles[i] if i < len(table_titles) else f"Table {i + 1}"
                 st.subheader(title)
-                st.dataframe(df, use_container_width=True)
+                # Display table with clickable links if URLs exist
+                if 'URL' in df.columns and not df['URL'].isna().all():
+                    # Create clickable links in the table
+                    df_display = df.copy()
+                    for idx, row in df_display.iterrows():
+                        if pd.notna(row['URL']) and row['URL']:
+                            # Handle different column names for GitHub vs Jira
+                            if 'Title' in df_display.columns:
+                                # GitHub format - make title clickable
+                                df_display.at[
+                                    idx, 'Title'] = f'<a href="{row["URL"]}" target="_blank">{row["Title"]}</a>'
+                            elif 'Summary' in df_display.columns:
+                                # Jira format - make summary clickable
+                                df_display.at[
+                                    idx, 'Summary'] = f'<a href="{row["URL"]}" target="_blank">{row["Summary"]}</a>'
+                    # Drop the URL column for display
+                    if 'URL' in df_display.columns:
+                        df_display = df_display.drop('URL', axis=1)
+                    st.markdown(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
+                else:
+                    st.dataframe(df, use_container_width=True)
 
 
 # ============================================================================
@@ -1013,11 +1672,11 @@ st.markdown("""
 with st.sidebar:
     st.header("Configuration")
 
-    # Connection Status
+    # Connection Status with enhanced Jira details
     st.markdown("**Connection Status**")
 
     status_github = "Connected" if st.session_state.github_client else "Not Connected"
-    status_jira = "Connected" if st.session_state.jira_client else "Not Connected"
+    status_jira = st.session_state.get('jira_connection_status', 'Not Connected')
     status_notion = "Connected" if st.session_state.notion_client else "Not Connected"
     status_openai = "Connected" if st.session_state.openai_key else "Not Connected"
 
@@ -1028,11 +1687,18 @@ with st.sidebar:
         f'<span class="status-indicator status-{"connected" if st.session_state.github_client else "disconnected"}">GitHub: {status_github}</span>',
         unsafe_allow_html=True)
     st.markdown(
-        f'<span class="status-indicator status-{"connected" if st.session_state.jira_client else "disconnected"}">Jira: {status_jira}</span>',
+        f'<span class="status-indicator status-{"connected" if status_jira == "Connected" else "disconnected"}">Jira: {status_jira}</span>',
         unsafe_allow_html=True)
     st.markdown(
         f'<span class="status-indicator status-{"connected" if st.session_state.notion_client else "disconnected"}">Notion: {status_notion}</span>',
         unsafe_allow_html=True)
+
+    # FIXED: Add Jira connection debugging info
+    if status_jira == 'Failed':
+        with st.expander("🔧 Jira Debug Info", expanded=False):
+            connection_details = st.session_state.get('jira_connection_details', {})
+            if connection_details:
+                st.json(connection_details)
 
     st.markdown("---")
 
@@ -1047,11 +1713,25 @@ with st.sidebar:
     gh_owner = st.text_input("Owner", key='sidebar_gh_owner')
     gh_repo = st.text_input("Repository", key='sidebar_gh_repo')
 
-    # Jira Configuration
+    # Jira Configuration - FIXED: Enhanced with validation hints
     st.subheader("Jira")
-    jira_url = st.text_input("Base URL", placeholder="https://company.atlassian.net", key='sidebar_jira_url')
-    jira_email = st.text_input("Email", key='sidebar_jira_email')
-    jira_token = st.text_input("API Token", type="password", key='sidebar_jira_token')
+    jira_url = st.text_input(
+        "Base URL",
+        placeholder="https://yourcompany.atlassian.net",
+        key='sidebar_jira_url',
+        help="Format: https://yourcompany.atlassian.net (no trailing slash)"
+    )
+    jira_email = st.text_input(
+        "Email",
+        key='sidebar_jira_email',
+        help="Your Atlassian account email address"
+    )
+    jira_token = st.text_input(
+        "API Token",
+        type="password",
+        key='sidebar_jira_token',
+        help="Generate at: https://id.atlassian.com/manage-profile/security/api-tokens"
+    )
     jira_project = st.text_input("Project Key", key='sidebar_jira_project')
 
     # Notion Configuration
@@ -1071,10 +1751,23 @@ with st.sidebar:
         st.success("Chat cleared!")
         st.rerun()
 
+    # FIXED: Add test connection button for debugging
+    if st.button("Test Jira Connection", use_container_width=True):
+        if st.session_state.get('jira_client'):
+            try:
+                health = st.session_state.jira_client.health_check()
+                if health.get('healthy'):
+                    st.success(f"✅ Jira connection OK: {health.get('user', 'Connected')}")
+                else:
+                    st.error(f"❌ Jira connection failed: {health.get('error')}")
+            except Exception as e:
+                st.error(f"❌ Connection test failed: {str(e)}")
+        else:
+            st.warning("No Jira client available. Connect first.")
+
 # Main Chat Interface
 st.subheader("Chat with Assistant")
 
-# Display chat history
 display_chat_history()
 
 # Chat input
@@ -1106,6 +1799,11 @@ st.markdown(f"**Status:** {connected_count}/3 platforms connected")
 
 if connected_count == 0:
     st.info("Connect your services in the sidebar to start using the assistant.")
+
+# FIXED: Add footer debug info for troubleshooting
+if st.session_state.get('jira_connection_status') == 'Failed':
+    st.warning(
+        "⚠️ Jira connection failed. Check the sidebar debug info or ensure your URL format is: https://yourcompany.atlassian.net")
 
 if __name__ == "__main__":
     if not IMPORTS_AVAILABLE:
