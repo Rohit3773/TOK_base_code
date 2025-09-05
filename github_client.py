@@ -131,6 +131,8 @@ class GitHubClient:
         # Repository operations
         'create_repository': {'name', 'description', 'private', 'has_issues', 'has_projects', 'has_wiki', 'auto_init',
                               'gitignore_template', 'license_template'},
+        'list_repositories': {'visibility', 'affiliation', 'type', 'sort', 'direction', 'per_page', 'page'},
+        'list_repository_contents': {'path', 'ref'},
         'fork_repository': {'organization'},
         'create_branch': {'branch', 'from_branch'},
         'list_branches': {'protected', 'per_page', 'page'},
@@ -481,6 +483,40 @@ class GitHubClient:
     def get_user(self) -> Dict[str, Any]:
         """Get current user info with caching."""
         return self._request("GET", "/user", cache_key="current_user")
+    
+    def list_repositories(self, **kwargs) -> Dict[str, Any]:
+        """List repositories for the authenticated user."""
+        cleaned_args = self._clean_args('list_repositories', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        
+        # GitHub API restriction: if visibility or affiliation is specified, type cannot be used
+        has_visibility_or_affiliation = any(key in cleaned_args for key in ['visibility', 'affiliation'])
+        
+        for k, v in cleaned_args.items():
+            if k != "per_page":
+                # Skip 'type' parameter if visibility or affiliation is already specified
+                if k == 'type' and has_visibility_or_affiliation:
+                    continue
+                params[k] = v
+        
+        return self._request("GET", "/user/repos", params=params, cache_key=f"user_repos:{hash(str(params))}")
+    
+    def list_user_repositories(self, username: str, **kwargs) -> Dict[str, Any]:
+        """List public repositories for a specific user."""
+        cleaned_args = self._clean_args('list_repositories', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+        
+        return self._request("GET", f"/users/{username}/repos", params=params, cache_key=f"repos:{username}:{hash(str(params))}")
+    
+    def list_organization_repositories(self, org: str, **kwargs) -> Dict[str, Any]:
+        """List repositories for an organization."""
+        cleaned_args = self._clean_args('list_repositories', kwargs)
+        params = {"per_page": min(cleaned_args.get("per_page", 30), self.config.max_per_page)}
+        params.update({k: v for k, v in cleaned_args.items() if k != "per_page"})
+        
+        return self._request("GET", f"/orgs/{org}/repos", params=params, cache_key=f"org_repos:{org}:{hash(str(params))}")
+        
 
     def get_repository(self, owner: str = "", repo: str = "") -> Dict[str, Any]:
         """Get repository information with caching."""
@@ -651,6 +687,18 @@ class GitHubClient:
             raise GitHubError("Owner and repo are required")
 
         cleaned_args = self._clean_args('get_file_contents', {'path': path, 'ref': ref, **kwargs})
+        params = {"ref": ref} if ref else {}
+
+        return self._request("GET", f"/repos/{owner}/{repo}/contents/{path}", params=params)
+    
+    def list_repository_contents(self, path: str = "", owner: str = "", repo: str = "", ref: str = "main", **kwargs) -> Dict[str, Any]:
+        """List repository contents (files and directories)."""
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        if not (owner and repo):
+            raise GitHubError("Owner and repo are required")
+
+        cleaned_args = self._clean_args('list_repository_contents', {'path': path, 'ref': ref, **kwargs})
         params = {"ref": ref} if ref else {}
 
         return self._request("GET", f"/repos/{owner}/{repo}/contents/{path}", params=params)

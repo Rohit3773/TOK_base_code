@@ -59,6 +59,9 @@ GITHUB_TOOLS = [
     ToolDefinition('gh_search_pull_requests', 'gh_search_pull_requests(query, sort?, order?, per_page?)', 'read', 6),
 
     # Repository and file operations
+    ToolDefinition('gh_list_repositories', 'gh_list_repositories(visibility?, affiliation?, type?, sort?)', 'read', 4),
+    ToolDefinition('gh_list_repository_contents', 'gh_list_repository_contents(owner, repo, path?, ref?)', 'read', 5),
+    ToolDefinition('gh_get_repository', 'gh_get_repository(owner, repo)', 'read', 3),
     ToolDefinition('gh_create_branch', 'gh_create_branch(owner, repo, branch, from_branch?)', 'create', 7),
     ToolDefinition('gh_list_branches', 'gh_list_branches(owner, repo)', 'read', 4),
     ToolDefinition('gh_list_commits', 'gh_list_commits(owner, repo, sha?, path?, author?)', 'read', 4),
@@ -153,6 +156,7 @@ JIRA_TOOLS = [
     ToolDefinition('jira_list_projects', 'jira_list_projects(expand?)', 'read', 4),
     ToolDefinition('jira_project_info', 'jira_project_info(project_key)', 'read', 4),
     ToolDefinition('jira_get_project_details', 'jira_get_project_details(project_key)', 'read', 4),
+    ToolDefinition('jira_create_project', 'jira_create_project(name, description?, lead?)', 'create', 7),
     ToolDefinition('jira_update_project', 'jira_update_project(project_key, name?, description?, lead?)', 'modify', 5),
     
     # User info
@@ -167,10 +171,14 @@ NOTION_TOOLS = [
     # Page operations
     ToolDefinition('notion_create_page', 'notion_create_page(parent_database_id?, parent_page_id?, properties?, children?)', 'create', 8),
     ToolDefinition('notion_update_page', 'notion_update_page(page_id, properties?, archived?)', 'modify', 7),
+    ToolDefinition('notion_update_page_by_name', 'notion_update_page_by_name(page_name, properties)', 'modify', 8),
+    ToolDefinition('notion_update_page_status_by_name', 'notion_update_page_status_by_name(page_name, status, database_id?)', 'modify', 9),
+    ToolDefinition('notion_update_status_with_database', 'notion_update_status_with_database(page_name, status, database_id)', 'modify', 10),
     ToolDefinition('notion_get_page', 'notion_get_page(page_id)', 'read', 5),
     
     # Database operations
     ToolDefinition('notion_get_database', 'notion_get_database(database_id)', 'read', 5),
+    ToolDefinition('notion_get_database_properties', 'notion_get_database_properties(database_id)', 'read', 6),
     ToolDefinition('notion_query_database', 'notion_query_database(database_id, filter_conditions?, sorts?, page_size?)', 'read', 6),
     ToolDefinition('notion_create_database', 'notion_create_database(parent_page_id, title, properties, description?)', 'create', 8),
     
@@ -525,7 +533,7 @@ def _build_github_search_query(user_message: str, owner: str, repo: str, item_ty
     return ' '.join(query_parts)
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=4096)
 def _build_optimized_system_prompt(
         allow_gh: bool,
         allow_jira: bool,
@@ -547,6 +555,8 @@ def _build_optimized_system_prompt(
             "- gh_update_issue(owner, repo, issue_number, state?, title?, body?) - Update issue",
             "- gh_add_issue_comment(owner, repo, issue_number, body) - Add comment",
             "- gh_list_issues(owner, repo, state?, labels?) - List issues",
+            "- gh_list_repositories(visibility?, affiliation?, type?, sort?) - List repositories", 
+            "- gh_list_repository_contents(owner, repo, path?, ref?) - List repository contents/files",
             "- gh_create_pull_request(owner, repo, title, head, base, body?) - Create PR",
             "- gh_list_branches(owner, repo) - List branches",
             "- gh_get_file_contents(owner, repo, path, ref?) - Get file contents",
@@ -651,9 +661,13 @@ CRITICAL ENTITY NORMALIZATION RULES:
    - "Get file contents path: docs/HELLO.md from main branch" → get_file_contents(path="docs/HELLO.md", ref="main")
    - ALWAYS include both path AND ref parameters
 
-8. BRANCH AND TAG LISTING:
+8. BRANCH, TAG, AND REPOSITORY LISTING:
    - "List tags in GitHub" → list_tags(owner, repo) 
    - "Tell me name of branches" → list_branches(owner, repo)
+   - "List repositories in GitHub" → list_repositories() 
+   - "Show my GitHub repositories" → list_repositories()
+   - "Show me what I have in repo_name repo" → list_repository_contents(owner="user", repo="repo_name")
+   - "List files in my_project repository" → list_repository_contents(owner, repo="my_project")
    - These should return data for display
 
 9. DEFAULT GITHUB LISTING:
@@ -665,15 +679,29 @@ CRITICAL ENTITY NORMALIZATION RULES:
     - "Show my Jira issues" → search with JQL for current project
     - "Mark Jira issue ABC-123 to Done" → list_transitions + transition_issue
     - "Add comment to ABC-123" → add_comment(issue_key="ABC-123", body="...")
+    - "Create new project named X" → create_project(name="X", description="...", lead="...") 
+    - "Create new issue in project Y" → create_issue(project_key="Y", summary="...", description="...")
+    - IMPORTANT: "Create project" = create_project, "Create issue" = create_issue - these are different operations!
 
 11. NOTION OPERATIONS:
     - "Tell me what I have in Notion" → query_database(database_id) to list all pages
     - "Create a Notion page" → create_page(parent_database_id, properties)
     - "Search Notion for X" → search(query="X") 
     - "Show Notion page Y" → search(query="Y") first, then get_page if specific page found
+    - "Add text to [page name]" or "append text to [page name]" → append_text_to_page(page_name="exact page name", text="text content")
+    - "Add text 'Hello World' to My Project page" → append_text_to_page(page_name="My Project", text="Hello World")
+    - "Change status of [page name] to [status]" → update_status_with_database(page_name="exact page name", status="status value", database_id="database_id") when database_id available
+    - "Set Testing Tools to Done, database_id: 261562f679f78041ab59c058a195aec0" → update_status_with_database(page_name="Testing Tools", status="Done", database_id="261562f679f78041ab59c058a195aec0")  
+    - "Update page [name] status to [status]" → update_status_with_database(page_name="name", status="status", database_id="database_id") when database_id available
+    - Use update_status_with_database when database_id is provided for better property detection
+    - For status updates: ALWAYS use update_page_status_by_name - it handles finding pages in databases automatically
+    - Include database_id parameter when available to ensure correct property detection
+    - If status update fails due to property validation, first use get_database_properties to check available properties
+    - Always extract the exact page name from user's message - can be any string the user mentions
     - Always use query_database for listing/browsing database contents
     - Use get_page only when you have a specific page_id (not database_id)
     - For "what do I have" queries, use query_database to show all pages
+    - For adding text to pages: ALWAYS extract the page name dynamically from user input
 
 12. ENHANCED ERROR HANDLING:
     - For search operations that might return no results, always include helpful message

@@ -1136,7 +1136,7 @@ class JiraClient:
             raise JiraError("No fields provided for update")
 
         try:
-            self._request("PUT", f"/issue/{issue_key}", json={"fields": fields})
+            self._request("PUT", f"/issue/{issue_key}", json_body={"fields": fields})
             
             # Return updated issue data
             return self._request("GET", f"/issue/{issue_key}")
@@ -1354,7 +1354,7 @@ class JiraClient:
             raise JiraError("No valid update fields provided")
 
         try:
-            self._request("PUT", f"/project/{project_key}", json=update_data)
+            self._request("PUT", f"/project/{project_key}", json_body=update_data)
             
             # Return updated project
             return self.get_project_details(project_key)

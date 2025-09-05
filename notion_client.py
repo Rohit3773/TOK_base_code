@@ -298,8 +298,8 @@ class NotionClient:
             
         parent = {"type": "page_id", "page_id": parent_page_id}
 
-        # Ensure title is properly formatted as rich text array with explicit link field
-        title_content = [{"type": "text", "text": {"content": title.strip(), "link": None}}]
+        # Format title as rich text array for database creation
+        title_content = [{"type": "text", "text": {"content": title.strip()}}]
 
         body = {
             "parent": parent,
@@ -311,7 +311,7 @@ class NotionClient:
             body["description"] = [{"type": "text", "text": {"content": description}}]
 
         logger.info(f"Creating database with title='{title}', parent_page_id='{parent_page_id}'")
-        logger.debug(f"Request body: {body}")
+        logger.info(f"Request body: {body}")
         
         try:
             result = self._request("POST", "/v1/databases", json_body=body)
@@ -323,6 +323,7 @@ class NotionClient:
             return result
         except Exception as e:
             logger.error(f"Database creation failed: {e}")
+            logger.error(f"Failed request body was: {body}")
             raise
 
     # ---------------- Enhanced Page Operations ----------------
@@ -479,7 +480,8 @@ class NotionClient:
             "page_size": min(page_size, self.config.max_per_page)
         }
 
-        if filter_value:
+        # Only add filter if filter_value is a valid object type
+        if filter_value and filter_value in ["page", "database"]:
             body["filter"] = {"value": filter_value, "property": "object"}
         if start_cursor:
             body["start_cursor"] = start_cursor
@@ -512,7 +514,8 @@ class NotionClient:
     def find_page_by_name(self, page_name: str) -> Optional[str]:
         """Find a page by name and return its ID."""
         try:
-            results = self.search(query=page_name, page_size=20)
+            # Search specifically for pages with the filter
+            results = self.search(query=page_name, filter_value="page", page_size=20)
             
             if results and 'results' in results:
                 for result in results['results']:
@@ -540,6 +543,192 @@ class NotionClient:
         except Exception as e:
             logger.error(f"Error finding page '{page_name}': {e}")
             return None
+
+    def find_database_by_name(self, database_name: str) -> Optional[str]:
+        """Find a database by name and return its ID."""
+        try:
+            # Search specifically for databases with the filter
+            results = self.search(query=database_name, filter_value="database", page_size=20)
+            
+            if results and 'results' in results:
+                for result in results['results']:
+                    if result.get('object') == 'database':
+                        # Check title for databases
+                        title_array = result.get('title', [])
+                        if title_array:
+                            title_text = ''.join([t.get('plain_text', '') for t in title_array])
+                            if title_text.lower().strip() == database_name.lower().strip():
+                                return result['id']
+            
+            # If no exact match, return the first database result if any
+            if results and 'results' in results and results['results']:
+                for result in results['results']:
+                    if result.get('object') == 'database':
+                        return result['id']
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding database '{database_name}': {e}")
+            return None
+
+    def find_page_in_database_by_title(self, database_id: str, page_title: str) -> Optional[str]:
+        """Find a page within a database by its title."""
+        try:
+            # Query the database for pages with matching title
+            results = self.query_database(database_id, page_size=100)
+            
+            if results and 'results' in results:
+                for result in results['results']:
+                    if result.get('object') == 'page':
+                        # Check if title matches (case-insensitive) 
+                        properties = result.get('properties', {})
+                        
+                        # Look for title in various property types
+                        for prop_name, prop_data in properties.items():
+                            if prop_data.get('type') == 'title':
+                                title_array = prop_data.get('title', [])
+                                if title_array:
+                                    title_text = ''.join([t.get('plain_text', '') for t in title_array])
+                                    if title_text.lower().strip() == page_title.lower().strip():
+                                        return result['id']
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding page '{page_title}' in database '{database_id}': {e}")
+            return None
+
+    def update_page_by_name(self, page_name: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+        """Update a page by finding it by name first."""
+        # First try to find it as a direct page
+        page_id = self.find_page_by_name(page_name)
+        
+        if page_id:
+            return self.update_page(page_id, properties=properties)
+        
+        # If not found as page, try to find as a database and get the first page in it
+        database_id = self.find_database_by_name(page_name)
+        
+        if database_id:
+            # Try to find a page with the same name in the database
+            page_in_db_id = self.find_page_in_database_by_title(database_id, page_name)
+            if page_in_db_id:
+                return self.update_page(page_in_db_id, properties=properties)
+            
+            # If no page with matching name, get the first page in the database
+            try:
+                results = self.query_database(database_id, page_size=1)
+                if results and 'results' in results and results['results']:
+                    first_page = results['results'][0]
+                    return self.update_page(first_page['id'], properties=properties)
+            except Exception as e:
+                logger.error(f"Error querying database for pages: {e}")
+        
+        raise NotionError(f"Could not find page or database named '{page_name}'")
+
+    def update_page_status_by_name(self, page_name: str, status: str, database_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        """Update the status property of a page by finding it by name."""
+        # First, try to get the database schema to find the correct status property
+        status_property_name = None
+        
+        if database_id:
+            try:
+                db_info = self.get_database(database_id)
+                properties = db_info.get('properties', {})
+                
+                # Look for status-like properties (select or multi-select type)
+                for prop_name, prop_config in properties.items():
+                    prop_type = prop_config.get('type', '')
+                    if prop_type in ['select', 'multi_select']:
+                        # Check if the property name suggests it's a status field
+                        prop_name_lower = prop_name.lower()
+                        if any(keyword in prop_name_lower for keyword in ['status', 'state', 'progress', 'stage', 'phase']):
+                            status_property_name = prop_name
+                            logger.info(f"Found status property: '{prop_name}' of type '{prop_type}'")
+                            break
+                
+                # If no status-like property found, use the first select property
+                if not status_property_name:
+                    for prop_name, prop_config in properties.items():
+                        if prop_config.get('type') == 'select':
+                            status_property_name = prop_name
+                            logger.info(f"Using first select property: '{prop_name}' as status")
+                            break
+                            
+            except Exception as e:
+                logger.warning(f"Could not get database schema: {e}")
+        
+        # If we found a specific property, use it
+        if status_property_name:
+            status_properties = {
+                status_property_name: {"select": {"name": status}}
+            }
+            try:
+                return self.update_page_by_name(page_name, status_properties)
+            except NotionError as e:
+                logger.error(f"Failed to update with detected property '{status_property_name}': {e}")
+                # If detected property fails, fall back to trying common names
+        
+        # Fallback: try common property names one by one
+        common_property_names = ["Status", "status", "State", "Progress", "Stage", "Phase"]
+        
+        for prop_name in common_property_names:
+            try:
+                status_properties = {prop_name: {"select": {"name": status}}}
+                result = self.update_page_by_name(page_name, status_properties)
+                logger.info(f"Successfully updated using property '{prop_name}'")
+                return result
+            except NotionError as e:
+                logger.debug(f"Property '{prop_name}' failed: {e}")
+                continue
+        
+        # If all attempts failed, raise an informative error
+        if database_id:
+            # Try to get property info to help user
+            try:
+                db_info = self.get_database_properties(database_id)
+                available_props = [name for name, info in db_info['properties'].items() 
+                                 if info['type'] in ['select', 'multi_select']]
+                error_msg = (f"Could not update status for page '{page_name}'. "
+                           f"Available select properties: {available_props}. "
+                           f"Please check that one of these properties accepts the value '{status}'.")
+            except Exception:
+                error_msg = f"Could not update status for page '{page_name}' with database ID '{database_id}'."
+        else:
+            error_msg = f"Could not update status for page '{page_name}'. No suitable status property found."
+        
+        raise NotionError(error_msg)
+
+    def update_status_with_database(self, page_name: str, status: str, database_id: str) -> Dict[str, Any]:
+        """Update status with database schema detection - new method to avoid caching issues."""
+        return self.update_page_status_by_name(page_name, status, database_id)
+
+    def get_database_properties(self, database_id: str) -> Dict[str, Any]:
+        """Get database properties for inspection and debugging."""
+        try:
+            db_info = self.get_database(database_id)
+            properties = db_info.get('properties', {})
+            
+            # Format properties for easy reading
+            formatted_properties = {}
+            for prop_name, prop_config in properties.items():
+                prop_type = prop_config.get('type', 'unknown')
+                formatted_properties[prop_name] = {
+                    'type': prop_type,
+                    'config': prop_config
+                }
+            
+            return {
+                'database_id': database_id,
+                'title': db_info.get('title', []),
+                'properties': formatted_properties,
+                'property_count': len(properties)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting database properties: {e}")
+            raise NotionError(f"Could not retrieve database properties: {e}")
 
     def append_text_to_page(self, page_name: str, text: str) -> Dict[str, Any]:
         """Append text to a page by finding it by name first."""
