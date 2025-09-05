@@ -281,16 +281,25 @@ class NotionClient:
 
     def create_database(
             self,
-            parent_page_id: str,
+            parent_page_id: Optional[str],
             title: str,
             properties: Dict[str, Any],
             description: Optional[str] = None
     ) -> Dict[str, Any]:
         """Create database with enhanced property support."""
 
+        # Handle parent - if no parent_page_id, raise error as database needs parent
+        if not parent_page_id:
+            raise NotionError("Database creation requires a parent page ID. Databases cannot be created in workspace root.")
+        
+        # Validate title
+        if not title or not title.strip():
+            raise NotionError("Title is required and cannot be empty")
+            
         parent = {"type": "page_id", "page_id": parent_page_id}
 
-        title_content = [{"type": "text", "text": {"content": title}}]
+        # Ensure title is properly formatted as rich text array with explicit link field
+        title_content = [{"type": "text", "text": {"content": title.strip(), "link": None}}]
 
         body = {
             "parent": parent,
@@ -301,12 +310,20 @@ class NotionClient:
         if description:
             body["description"] = [{"type": "text", "text": {"content": description}}]
 
-        result = self._request("POST", "/v1/databases", json_body=body)
-
-        # Clear database cache
-        self._invalidate_cache_pattern("database:")
-
-        return result
+        logger.info(f"Creating database with title='{title}', parent_page_id='{parent_page_id}'")
+        logger.debug(f"Request body: {body}")
+        
+        try:
+            result = self._request("POST", "/v1/databases", json_body=body)
+            logger.info(f"Database creation successful: {result.get('id', 'unknown')}")
+            
+            # Clear database cache
+            self._invalidate_cache_pattern("database:")
+            
+            return result
+        except Exception as e:
+            logger.error(f"Database creation failed: {e}")
+            raise
 
     # ---------------- Enhanced Page Operations ----------------
 
@@ -491,6 +508,52 @@ class NotionClient:
                 "rich_text": [{"type": "text", "text": {"content": text}}]
             }
         }
+
+    def find_page_by_name(self, page_name: str) -> Optional[str]:
+        """Find a page by name and return its ID."""
+        try:
+            results = self.search(query=page_name, page_size=20)
+            
+            if results and 'results' in results:
+                for result in results['results']:
+                    if result.get('object') == 'page':
+                        # Check if title matches (case-insensitive)
+                        properties = result.get('properties', {})
+                        
+                        # Look for title in various property types
+                        for prop_name, prop_data in properties.items():
+                            if prop_data.get('type') == 'title':
+                                title_array = prop_data.get('title', [])
+                                if title_array:
+                                    title_text = ''.join([t.get('plain_text', '') for t in title_array])
+                                    if title_text.lower().strip() == page_name.lower().strip():
+                                        return result['id']
+            
+            # If no exact match, return the first page result if any
+            if results and 'results' in results and results['results']:
+                for result in results['results']:
+                    if result.get('object') == 'page':
+                        return result['id']
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding page '{page_name}': {e}")
+            return None
+
+    def append_text_to_page(self, page_name: str, text: str) -> Dict[str, Any]:
+        """Append text to a page by finding it by name first."""
+        # Find the page by name
+        page_id = self.find_page_by_name(page_name)
+        
+        if not page_id:
+            raise NotionError(f"Could not find page named '{page_name}'")
+        
+        # Create a text block
+        text_block = self.create_text_block(text, "paragraph")
+        
+        # Append the block to the page
+        return self.append_block_children(page_id, [text_block])
 
     def create_to_do_block(self, text: str, checked: bool = False) -> Dict[str, Any]:
         """Create a to-do block."""

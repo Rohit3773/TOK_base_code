@@ -1076,3 +1076,291 @@ class JiraClient:
                 raise JiraError(f"Could not find transition to '{target_status}' for {issue_key}")
 
         return self.transition_issue(issue_key, transition_id, comment)
+
+    # ============================================================================
+    # MISSING JIRA OPERATIONS - IMPLEMENTATION
+    # ============================================================================
+
+    def update_issue(
+            self,
+            issue_key: str,
+            summary: Optional[str] = None,
+            description: Optional[Union[str, Dict, List]] = None,
+            assignee: Optional[str] = None,
+            priority: Optional[str] = None,
+            labels: Optional[List[str]] = None,
+            additional_fields: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Update an existing issue with enhanced field support."""
+        if not issue_key or not issue_key.strip():
+            raise JiraError("Issue key cannot be empty")
+
+        issue_key = issue_key.strip()
+        fields = {}
+
+        # Update summary
+        if summary is not None and summary.strip():
+            fields["summary"] = summary.strip()
+
+        # Update description
+        if description is not None:
+            if isinstance(description, str) and description.strip():
+                fields["description"] = self._create_adf_content(description)
+            elif isinstance(description, (dict, list)):
+                fields["description"] = self._create_adf_content(description)
+
+        # Update assignee
+        if assignee is not None:
+            if assignee.strip():
+                fields["assignee"] = {"accountId": assignee} if "@" not in assignee else {"emailAddress": assignee}
+            else:
+                fields["assignee"] = None  # Unassign
+
+        # Update priority
+        if priority is not None and priority.strip():
+            # Try to find priority by name
+            try:
+                fields["priority"] = {"name": priority.strip()}
+            except Exception as e:
+                logger.warning(f"Could not set priority '{priority}': {e}")
+
+        # Update labels
+        if labels is not None:
+            fields["labels"] = [label.strip() for label in labels if label and label.strip()]
+
+        # Add any additional fields
+        if additional_fields:
+            fields.update(additional_fields)
+
+        if not fields:
+            raise JiraError("No fields provided for update")
+
+        try:
+            self._request("PUT", f"/issue/{issue_key}", json={"fields": fields})
+            
+            # Return updated issue data
+            return self._request("GET", f"/issue/{issue_key}")
+        except JiraError as e:
+            if e.status_code == 404:
+                raise JiraError(f"Issue '{issue_key}' not found")
+            raise JiraError(f"Failed to update issue '{issue_key}': {str(e)}")
+
+    def delete_issue(self, issue_key: str, delete_subtasks: bool = False) -> Dict[str, Any]:
+        """Delete an issue with optional subtask deletion."""
+        if not issue_key or not issue_key.strip():
+            raise JiraError("Issue key cannot be empty")
+
+        issue_key = issue_key.strip()
+        
+        try:
+            params = {}
+            if delete_subtasks:
+                params["deleteSubtasks"] = "true"
+            
+            self._request("DELETE", f"/issue/{issue_key}", params=params)
+            
+            return {"success": True, "message": f"Issue {issue_key} deleted successfully"}
+        except JiraError as e:
+            if e.status_code == 404:
+                raise JiraError(f"Issue '{issue_key}' not found")
+            elif e.status_code == 403:
+                raise JiraError(f"Permission denied: Cannot delete issue '{issue_key}'")
+            raise JiraError(f"Failed to delete issue '{issue_key}': {str(e)}")
+
+    def set_issue_labels(self, issue_key: str, labels: List[str]) -> Dict[str, Any]:
+        """Set labels for an issue (replaces existing labels)."""
+        if not issue_key or not issue_key.strip():
+            raise JiraError("Issue key cannot be empty")
+
+        cleaned_labels = [label.strip() for label in labels if label and label.strip()]
+        
+        return self.update_issue(issue_key, labels=cleaned_labels)
+
+    def add_issue_labels(self, issue_key: str, labels: List[str]) -> Dict[str, Any]:
+        """Add labels to an issue (keeps existing labels)."""
+        if not issue_key or not issue_key.strip():
+            raise JiraError("Issue key cannot be empty")
+
+        issue_key = issue_key.strip()
+        
+        try:
+            # Get current issue to retrieve existing labels
+            current_issue = self._request("GET", f"/issue/{issue_key}?fields=labels")
+            current_labels = [label for label in current_issue.get("fields", {}).get("labels", [])]
+            
+            # Combine existing and new labels
+            new_labels = [label.strip() for label in labels if label and label.strip()]
+            all_labels = list(set(current_labels + new_labels))
+            
+            return self.update_issue(issue_key, labels=all_labels)
+        except JiraError as e:
+            if e.status_code == 404:
+                raise JiraError(f"Issue '{issue_key}' not found")
+            raise
+
+    def remove_issue_labels(self, issue_key: str, labels: List[str]) -> Dict[str, Any]:
+        """Remove specific labels from an issue."""
+        if not issue_key or not issue_key.strip():
+            raise JiraError("Issue key cannot be empty")
+
+        issue_key = issue_key.strip()
+        
+        try:
+            # Get current issue to retrieve existing labels
+            current_issue = self._request("GET", f"/issue/{issue_key}?fields=labels")
+            current_labels = [label for label in current_issue.get("fields", {}).get("labels", [])]
+            
+            # Remove specified labels
+            labels_to_remove = [label.strip().lower() for label in labels if label and label.strip()]
+            remaining_labels = [label for label in current_labels 
+                              if label.lower() not in labels_to_remove]
+            
+            return self.update_issue(issue_key, labels=remaining_labels)
+        except JiraError as e:
+            if e.status_code == 404:
+                raise JiraError(f"Issue '{issue_key}' not found")
+            raise
+
+    def set_issue_priority(self, issue_key: str, priority: str) -> Dict[str, Any]:
+        """Set priority for an issue."""
+        if not issue_key or not issue_key.strip():
+            raise JiraError("Issue key cannot be empty")
+        
+        if not priority or not priority.strip():
+            raise JiraError("Priority cannot be empty")
+
+        return self.update_issue(issue_key, priority=priority.strip())
+
+    def assign_issue(self, issue_key: str, assignee: str) -> Dict[str, Any]:
+        """Assign issue to a user."""
+        if not issue_key or not issue_key.strip():
+            raise JiraError("Issue key cannot be empty")
+        
+        if not assignee or not assignee.strip():
+            raise JiraError("Assignee cannot be empty")
+
+        return self.update_issue(issue_key, assignee=assignee.strip())
+
+    def unassign_issue(self, issue_key: str) -> Dict[str, Any]:
+        """Unassign issue (remove assignee)."""
+        if not issue_key or not issue_key.strip():
+            raise JiraError("Issue key cannot be empty")
+
+        return self.update_issue(issue_key, assignee="")
+
+    def get_issue(self, issue_key: str, expand_fields: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Get detailed information about a specific issue."""
+        if not issue_key or not issue_key.strip():
+            raise JiraError("Issue key cannot be empty")
+
+        issue_key = issue_key.strip()
+        
+        try:
+            params = {}
+            if expand_fields:
+                params["expand"] = ",".join(expand_fields)
+            
+            issue = self._request("GET", f"/issue/{issue_key}", params=params)
+            
+            # Return processed issue for consistency
+            return self._process_search_results([issue])[0] if issue else {}
+        except JiraError as e:
+            if e.status_code == 404:
+                raise JiraError(f"Issue '{issue_key}' not found")
+            raise JiraError(f"Failed to get issue '{issue_key}': {str(e)}")
+
+    def list_projects(self, expand: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """List all accessible projects."""
+        try:
+            params = {}
+            if expand:
+                params["expand"] = ",".join(expand)
+            
+            projects = self._request("GET", "/project", params=params, cache_key="projects")
+            
+            # Process projects for consistent format
+            processed_projects = []
+            for project in projects:
+                processed_project = {
+                    "key": project.get("key"),
+                    "id": project.get("id"),
+                    "name": project.get("name"),
+                    "description": project.get("description"),
+                    "lead": self._extract_display_name(project.get("lead")),
+                    "projectTypeKey": project.get("projectTypeKey"),
+                    "url": f"{self.base}/browse/{project.get('key')}" if project.get("key") else None
+                }
+                
+                # Add additional fields if available
+                if "issueTypes" in project:
+                    processed_project["issueTypes"] = project["issueTypes"]
+                if "roles" in project:
+                    processed_project["roles"] = project["roles"]
+                    
+                processed_projects.append(processed_project)
+            
+            return processed_projects
+        except JiraError as e:
+            raise JiraError(f"Failed to list projects: {str(e)}")
+
+    def get_project_details(self, project_key: str) -> Dict[str, Any]:
+        """Get detailed information about a specific project."""
+        if not project_key or not project_key.strip():
+            raise JiraError("Project key cannot be empty")
+
+        project_key = project_key.strip().upper()
+        
+        try:
+            project = self._request("GET", f"/project/{project_key}", cache_key=f"project_details:{project_key}")
+            
+            # Process project for display
+            processed_project = {
+                "key": project.get("key"),
+                "id": project.get("id"),
+                "name": project.get("name"),
+                "description": project.get("description"),
+                "lead": self._extract_display_name(project.get("lead")),
+                "projectTypeKey": project.get("projectTypeKey"),
+                "url": f"{self.base}/browse/{project.get('key')}" if project.get("key") else None,
+                "issueTypes": project.get("issueTypes", []),
+                "roles": project.get("roles", {}),
+                "components": project.get("components", []),
+                "versions": project.get("versions", [])
+            }
+            
+            return processed_project
+        except JiraError as e:
+            if e.status_code == 404:
+                raise JiraError(f"Project '{project_key}' not found")
+            raise JiraError(f"Failed to get project details for '{project_key}': {str(e)}")
+
+    def update_project(self, project_key: str, **kwargs) -> Dict[str, Any]:
+        """Update project settings (limited based on permissions)."""
+        if not project_key or not project_key.strip():
+            raise JiraError("Project key cannot be empty")
+
+        project_key = project_key.strip().upper()
+        
+        # Build update payload
+        update_data = {}
+        if "name" in kwargs and kwargs["name"]:
+            update_data["name"] = kwargs["name"].strip()
+        if "description" in kwargs:
+            update_data["description"] = kwargs["description"]
+        if "lead" in kwargs and kwargs["lead"]:
+            update_data["lead"] = kwargs["lead"].strip()
+
+        if not update_data:
+            raise JiraError("No valid update fields provided")
+
+        try:
+            self._request("PUT", f"/project/{project_key}", json=update_data)
+            
+            # Return updated project
+            return self.get_project_details(project_key)
+        except JiraError as e:
+            if e.status_code == 404:
+                raise JiraError(f"Project '{project_key}' not found")
+            elif e.status_code == 403:
+                raise JiraError(f"Permission denied: Cannot update project '{project_key}'")
+            raise JiraError(f"Failed to update project '{project_key}': {str(e)}")

@@ -703,14 +703,42 @@ def execute_jira_action(client, tool: str, args: dict) -> dict:
                         logger.error(f"Failed to transition {issue_key}: {e}")
                         return {'error': f'Failed to transition issue: {str(e)}'}
 
-        # Action mapping
+        # Action mapping - Enhanced with new operations
         action_map = {
+            # Core issue operations
             'create_issue': lambda: client.create_issue(**args),
-            'search': lambda: client.search(**args),
+            'update_issue': lambda: client.update_issue(**args),
+            'delete_issue': lambda: client.delete_issue(**args),
+            'get_issue': lambda: client.get_issue(**args),
+            
+            # Comments
             'add_comment': lambda: client.add_comment(**args),
+            
+            # Transitions and status  
             'transition_issue': lambda: client.transition_issue(**args),
             'list_transitions': lambda: client.list_transitions(**args),
+            'transition_to_status': lambda: client.transition_to_status(**args),
+            
+            # Labels management
+            'set_issue_labels': lambda: client.set_issue_labels(**args),
+            'add_issue_labels': lambda: client.add_issue_labels(**args),
+            'remove_issue_labels': lambda: client.remove_issue_labels(**args),
+            
+            # Priority and assignment
+            'set_issue_priority': lambda: client.set_issue_priority(**args),
+            'assign_issue': lambda: client.assign_issue(**args),
+            'unassign_issue': lambda: client.unassign_issue(**args),
+            
+            # Search and listing
+            'search': lambda: client.search(**args),
+            
+            # Project management
+            'list_projects': lambda: client.list_projects(**args),
             'project_info': lambda: client.project_info(**args),
+            'get_project_details': lambda: client.get_project_details(**args),
+            'update_project': lambda: client.update_project(**args),
+            
+            # User info
             'whoami': lambda: client.whoami(),
         }
 
@@ -750,14 +778,48 @@ def execute_notion_action(client, tool: str, args: dict) -> dict:
             if 'content' in args:
                 args['body'] = args.pop('content')
 
+            # FIXED: Handle parent parameter properly - don't use 'parent', use direct parameters
+            # Add default database_id if not provided
+            if 'parent_database_id' not in args and 'parent_page_id' not in args:
+                if st.session_state.notion_database_id:
+                    args['parent_database_id'] = st.session_state.notion_database_id
+
+            # FIXED: Improve property handling to handle different property types
             if 'properties' in args:
                 props = args.get('properties', {})
                 if isinstance(props, dict):
+                    # First, get the database schema to understand property types
+                    database_id = args.get('parent_database_id') or st.session_state.notion_database_id
+                    database_schema = {}
+                    
+                    if database_id:
+                        try:
+                            db_info = client.get_database(database_id)
+                            database_schema = db_info.get('properties', {})
+                        except Exception as e:
+                            # If we can't get the schema, proceed with basic formatting
+                            pass
+                    
                     formatted_props = {}
                     for key, value in props.items():
+                        # Check if the property exists in the database schema
+                        if database_schema and key not in database_schema:
+                            # Skip properties that don't exist in the database
+                            logger.warning(f"Skipping property '{key}' - not found in database schema")
+                            continue
+                        
+                        prop_schema = database_schema.get(key, {})
+                        prop_type = prop_schema.get('type', 'rich_text')  # default to rich_text
+                        
                         if isinstance(value, str):
-                            if key.lower() in ['title', 'name']:
+                            if key.lower() in ['title', 'name'] or prop_type == 'title':
                                 formatted_props[key] = {"title": [{"type": "text", "text": {"content": value}}]}
+                            elif prop_type == 'select':
+                                formatted_props[key] = {"select": {"name": value}}
+                            elif prop_type == 'multi_select':
+                                # Handle multi-select by splitting comma-separated values
+                                options = [opt.strip() for opt in value.split(',')]
+                                formatted_props[key] = {"multi_select": [{"name": opt} for opt in options]}
                             else:
                                 formatted_props[key] = {"rich_text": [{"type": "text", "text": {"content": value}}]}
                         elif isinstance(value, (int, float)):
@@ -768,8 +830,30 @@ def execute_notion_action(client, tool: str, args: dict) -> dict:
                             formatted_props[key] = value
                     args['properties'] = formatted_props
 
-            # Clean up parameters
-            valid_params = {'parent', 'properties', 'children', 'icon', 'cover'}
+            # Clean up parameters - keep parent_database_id and parent_page_id as direct parameters
+            valid_params = {'parent_database_id', 'parent_page_id', 'properties', 'children', 'icon', 'cover'}
+            cleaned_args = {k: v for k, v in args.items() if k in valid_params}
+            args = cleaned_args
+
+        elif tool == 'create_database':
+            # FIXED: Handle database creation parameters properly
+            # Ensure title is provided and not empty
+            if not args.get('title'):
+                return {'error': 'Title is required for database creation'}
+                
+            # Ensure we have properties - create default if not provided
+            if 'properties' not in args:
+                args['properties'] = {
+                    "Name": {"title": {}},  # Default title property
+                    "Status": {"select": {"options": []}}  # Default status property
+                }
+            
+            # Database creation requires a parent page ID - cannot be created in workspace root
+            if 'parent_page_id' not in args or not args.get('parent_page_id'):
+                return {'error': 'Database creation requires a parent page ID. Please create a page first, then create the database under that page.'}
+                    
+            # Clean parameters for database creation
+            valid_params = {'parent_page_id', 'title', 'properties', 'description'}
             cleaned_args = {k: v for k, v in args.items() if k in valid_params}
             args = cleaned_args
 
@@ -787,6 +871,7 @@ def execute_notion_action(client, tool: str, args: dict) -> dict:
             'search': lambda: client.search(**args),
             'create_database': lambda: client.create_database(**args),
             'append_blocks': lambda: client.append_block_children(**args),
+            'append_text_to_page': lambda: client.append_text_to_page(**args),
             'get_users': lambda: client.get_users(),
             'get_bot_info': lambda: client.get_bot_info(),
         }
@@ -803,8 +888,30 @@ def execute_notion_action(client, tool: str, args: dict) -> dict:
         return {'error': str(e)}
 
 
+def get_conversation_context(max_messages: int = 5) -> str:
+    """Extract relevant context from recent chat history for short-term memory."""
+    if not st.session_state.chat_history:
+        return ""
+    
+    # Get the last few messages for context
+    recent_messages = st.session_state.chat_history[-max_messages:]
+    context_parts = []
+    
+    for msg in recent_messages:
+        if msg['role'] == 'user':
+            context_parts.append(f"User: {msg['content']}")
+        elif msg['role'] == 'assistant':
+            # Extract key information from assistant responses
+            content = msg.get('content', '')
+            # Include responses that asked for information or mentioned missing data
+            if any(keyword in content.lower() for keyword in ['need', 'require', 'missing', 'which', 'what', 'specify']):
+                context_parts.append(f"Assistant: {content}")
+    
+    return "\n".join(context_parts) if context_parts else ""
+
+
 def get_ai_response_with_actions(user_message: str, model: str) -> Dict[str, Any]:
-    """Get AI response with actions using the improved LLM agent."""
+    """Get AI response with actions using the improved LLM agent with short-term memory."""
     if not st.session_state.openai_key:
         return {'error': 'OpenAI API key not configured'}
 
@@ -812,11 +919,19 @@ def get_ai_response_with_actions(user_message: str, model: str) -> Dict[str, Any
         # FIXED: Ensure Jira project key is properly passed
         jira_project = st.session_state.get('jira_project', '').strip()
 
+        # Add conversation context for short-term memory
+        conversation_context = get_conversation_context()
+        
+        # Enhanced user message with context if available
+        enhanced_message = user_message
+        if conversation_context:
+            enhanced_message = f"Recent conversation context:\n{conversation_context}\n\nCurrent request: {user_message}"
+
         # Use the improved propose_actions function
         result = propose_actions(
             openai_key=st.session_state.openai_key,
             model=model,
-            user_message=user_message,
+            user_message=enhanced_message,
             gh_owner=st.session_state.gh_owner,
             gh_repo=st.session_state.gh_repo,
             jira_project_key=jira_project,
@@ -825,7 +940,8 @@ def get_ai_response_with_actions(user_message: str, model: str) -> Dict[str, Any
 
         return {
             "message": result.get("message", "Task processed"),
-            "actions": result.get("actions", [])
+            "actions": result.get("actions", []),
+            "needs_info": result.get("needs_info", False)
         }
 
     except Exception as e:
@@ -1476,7 +1592,119 @@ def format_execution_results_with_tables(results: List[Dict]) -> Tuple[str, List
 
             # Notion actions
             elif service.lower() == 'notion':
-                if isinstance(data, list):
+                if raw_action == 'create_page':
+                    # Handle page creation results
+                    if isinstance(data, dict):
+                        page_id = data.get('id', 'Unknown')
+                        page_url = data.get('url', '')
+                        
+                        # Extract title from properties if available
+                        page_title = "New Page"
+                        properties = data.get('properties', {})
+                        for prop_name, prop_data in properties.items():
+                            if prop_data.get('type') == 'title':
+                                title_texts = prop_data.get('title', [])
+                                if title_texts:
+                                    page_title = ''.join([t.get('plain_text', '') for t in title_texts])
+                                    break
+                        
+                        if not page_title or page_title.strip() == "":
+                            page_title = "New Page"
+                        
+                        summary_parts.append(f"Notion: Page '{page_title}' created")
+                        summary_parts.append(f"   Page ID: {page_id}")
+                        if page_url:
+                            summary_parts.append(f"   URL: {page_url}")
+                        
+                        # Show page properties if available
+                        if properties:
+                            prop_summary = []
+                            for prop_name, prop_data in properties.items():
+                                if prop_data.get('type') == 'title':
+                                    continue  # Already shown as title
+                                elif prop_data.get('type') == 'rich_text':
+                                    text_content = prop_data.get('rich_text', [])
+                                    if text_content:
+                                        text_value = ''.join([t.get('plain_text', '') for t in text_content])
+                                        if text_value.strip():
+                                            prop_summary.append(f"{prop_name}: {text_value[:50]}{'...' if len(text_value) > 50 else ''}")
+                                elif prop_data.get('type') == 'number':
+                                    number_value = prop_data.get('number')
+                                    if number_value is not None:
+                                        prop_summary.append(f"{prop_name}: {number_value}")
+                                elif prop_data.get('type') == 'select':
+                                    select_value = prop_data.get('select')
+                                    if select_value:
+                                        prop_summary.append(f"{prop_name}: {select_value.get('name', '')}")
+                            
+                            if prop_summary:
+                                summary_parts.append(f"   Properties: {', '.join(prop_summary[:3])}")
+                    else:
+                        summary_parts.append(f"Notion: Page created successfully")
+
+                elif raw_action == 'query_database':
+                    # Handle database query results
+                    if isinstance(data, list):
+                        summary_parts.append(f"Notion: Found {len(data)} pages in database")
+                        if data:
+                            df = create_notion_pages_dataframe(data)
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append("Notion Pages")
+                    elif isinstance(data, dict) and 'results' in data:
+                        results = data['results']
+                        summary_parts.append(f"Notion: Found {len(results)} pages in database")
+                        if results:
+                            df = create_notion_pages_dataframe(results)
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append("Notion Pages")
+                    else:
+                        summary_parts.append(f"Notion: Database query completed")
+
+                elif raw_action == 'get_page':
+                    # Handle get page results  
+                    if isinstance(data, dict):
+                        page_title = "Page"
+                        properties = data.get('properties', {})
+                        for prop_name, prop_data in properties.items():
+                            if prop_data.get('type') == 'title':
+                                title_texts = prop_data.get('title', [])
+                                if title_texts:
+                                    page_title = ''.join([t.get('plain_text', '') for t in title_texts])
+                                    break
+                        
+                        summary_parts.append(f"Notion: Page '{page_title}' details retrieved")
+                        
+                        # Display as single-row table
+                        df = create_notion_pages_dataframe([data])
+                        if not df.empty:
+                            dataframes.append(df)
+                            table_titles.append("Notion Page Details")
+                    else:
+                        summary_parts.append(f"Notion: Page details retrieved")
+
+                elif raw_action == 'search':
+                    # Handle search results
+                    if isinstance(data, dict) and 'results' in data:
+                        results = data['results']
+                        summary_parts.append(f"Notion: Found {len(results)} items in search")
+                        if results:
+                            df = create_notion_pages_dataframe(results)
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append("Notion Search Results")
+                    elif isinstance(data, list):
+                        summary_parts.append(f"Notion: Found {len(data)} items in search")
+                        if data:
+                            df = create_notion_pages_dataframe(data)
+                            if not df.empty:
+                                dataframes.append(df)
+                                table_titles.append("Notion Search Results")
+                    else:
+                        summary_parts.append(f"Notion: Search completed")
+
+                elif isinstance(data, list):
                     summary_parts.append(f"Notion: Found {len(data)} items")
                     if data:
                         df = create_notion_pages_dataframe(data)
@@ -1484,7 +1712,7 @@ def format_execution_results_with_tables(results: List[Dict]) -> Tuple[str, List
                             dataframes.append(df)
                             table_titles.append("Notion Pages")
                 elif isinstance(data, dict):
-                    if 'name' in data and service == 'Notion':
+                    if 'name' in data and raw_action == 'get_bot_info':
                         summary_parts.append(f"Notion: Bot - {data['name']}")
                     else:
                         summary_parts.append(f"Notion: {action} completed")

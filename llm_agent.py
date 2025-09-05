@@ -120,14 +120,69 @@ GITHUB_TOOLS = [
 ]
 
 JIRA_TOOLS = [
+    # Core issue operations
     ToolDefinition('jira_create_issue', 'jira_create_issue(project_key, summary, description?, issuetype_name?)',
                    'create', 8),
+    ToolDefinition('jira_update_issue', 'jira_update_issue(issue_key, summary?, description?, assignee?, priority?, labels?)',
+                   'modify', 7),
+    ToolDefinition('jira_delete_issue', 'jira_delete_issue(issue_key, delete_subtasks?)', 'modify', 6),
+    ToolDefinition('jira_get_issue', 'jira_get_issue(issue_key, expand_fields?)', 'read', 5),
+    
+    # Comments
     ToolDefinition('jira_add_comment', 'jira_add_comment(issue_key, body)', 'modify', 6),
+    
+    # Transitions and status
     ToolDefinition('jira_transition_issue', 'jira_transition_issue(issue_key, transition_id)', 'modify', 7),
     ToolDefinition('jira_list_transitions', 'jira_list_transitions(issue_key)', 'read', 4),
+    ToolDefinition('jira_transition_to_status', 'jira_transition_to_status(issue_key, target_status, comment?)', 'modify', 8),
+    
+    # Labels management
+    ToolDefinition('jira_set_issue_labels', 'jira_set_issue_labels(issue_key, labels)', 'modify', 6),
+    ToolDefinition('jira_add_issue_labels', 'jira_add_issue_labels(issue_key, labels)', 'modify', 6),
+    ToolDefinition('jira_remove_issue_labels', 'jira_remove_issue_labels(issue_key, labels)', 'modify', 6),
+    
+    # Priority and assignment
+    ToolDefinition('jira_set_issue_priority', 'jira_set_issue_priority(issue_key, priority)', 'modify', 6),
+    ToolDefinition('jira_assign_issue', 'jira_assign_issue(issue_key, assignee)', 'modify', 6),
+    ToolDefinition('jira_unassign_issue', 'jira_unassign_issue(issue_key)', 'modify', 6),
+    
+    # Search and listing
     ToolDefinition('jira_search', 'jira_search(jql, max_results?)', 'read', 5),
+    
+    # Project management
+    ToolDefinition('jira_list_projects', 'jira_list_projects(expand?)', 'read', 4),
     ToolDefinition('jira_project_info', 'jira_project_info(project_key)', 'read', 4),
+    ToolDefinition('jira_get_project_details', 'jira_get_project_details(project_key)', 'read', 4),
+    ToolDefinition('jira_update_project', 'jira_update_project(project_key, name?, description?, lead?)', 'modify', 5),
+    
+    # User info
     ToolDefinition('jira_whoami', 'jira_whoami()', 'read', 3),
+]
+
+NOTION_TOOLS = [
+    # User and bot operations
+    ToolDefinition('notion_get_bot_info', 'notion_get_bot_info()', 'read', 3),
+    ToolDefinition('notion_get_users', 'notion_get_users()', 'read', 4),
+    
+    # Page operations
+    ToolDefinition('notion_create_page', 'notion_create_page(parent_database_id?, parent_page_id?, properties?, children?)', 'create', 8),
+    ToolDefinition('notion_update_page', 'notion_update_page(page_id, properties?, archived?)', 'modify', 7),
+    ToolDefinition('notion_get_page', 'notion_get_page(page_id)', 'read', 5),
+    
+    # Database operations
+    ToolDefinition('notion_get_database', 'notion_get_database(database_id)', 'read', 5),
+    ToolDefinition('notion_query_database', 'notion_query_database(database_id, filter_conditions?, sorts?, page_size?)', 'read', 6),
+    ToolDefinition('notion_create_database', 'notion_create_database(parent_page_id, title, properties, description?)', 'create', 8),
+    
+    # Block operations
+    ToolDefinition('notion_append_blocks', 'notion_append_blocks(block_id, children)', 'modify', 6),
+    ToolDefinition('notion_append_text_to_page', 'notion_append_text_to_page(page_name, text)', 'modify', 7),
+    
+    # Search operations
+    ToolDefinition('notion_search', 'notion_search(query, sort_direction?, filter_value?)', 'read', 6),
+    
+    # Batch operations
+    ToolDefinition('notion_batch_create_pages', 'notion_batch_create_pages(pages_json, parallel?)', 'create', 8),
 ]
 
 
@@ -241,11 +296,12 @@ def _extract_issue_title(text: str) -> Optional[str]:
 def _infer_platform_intent(
         user_message: str,
         has_gh_context: bool,
-        has_jira_context: bool
-) -> Tuple[bool, bool]:
-    """Cached platform intent inference with improved logic."""
+        has_jira_context: bool,
+        has_notion_context: bool = False
+) -> Tuple[bool, bool, bool]:
+    """Cached platform intent inference with improved logic including Notion."""
     if not user_message:
-        return (has_gh_context, has_jira_context)
+        return (has_gh_context, has_jira_context, has_notion_context)
 
     msg_lower = user_message.lower()
 
@@ -253,10 +309,12 @@ def _infer_platform_intent(
     github_keywords = {'github', 'repo', 'repository', 'pull request', 'pr', 'branch', 'commit', 'workflow', 'release',
                        'tag', 'gist', 'file contents', 'merge'}
     jira_keywords = {'jira', 'issue', 'ticket', 'project', 'jql', 'epic', 'story', 'bug', 'task', 'transition'}
+    notion_keywords = {'notion', 'page', 'database', 'block', 'workspace', 'note', 'document', 'property', 'template'}
 
     # Count keyword occurrences for confidence scoring
     gh_score = sum(1 for kw in github_keywords if kw in msg_lower)
     jira_score = sum(1 for kw in jira_keywords if kw in msg_lower)
+    notion_score = sum(1 for kw in notion_keywords if kw in msg_lower)
 
     # Check for explicit patterns
     has_repo_pattern = _extract_owner_repo(user_message) is not None
@@ -272,17 +330,26 @@ def _infer_platform_intent(
 
     mentions_github = gh_score > 0 or has_repo_pattern or has_gh_issue
     mentions_jira = jira_score > 0 or has_jira_key
+    mentions_notion = notion_score > 0
 
     # Decision logic with context consideration
-    if mentions_github and not mentions_jira:
-        return (True, False)
-    elif mentions_jira and not mentions_github:
-        return (False, True)
-    elif mentions_github and mentions_jira:
-        return (True, True)  # Mixed intent - allow both
+    if mentions_github and not mentions_jira and not mentions_notion:
+        return (True, False, False)
+    elif mentions_jira and not mentions_github and not mentions_notion:
+        return (False, True, False)
+    elif mentions_notion and not mentions_github and not mentions_jira:
+        return (False, False, True)
+    elif mentions_github and mentions_jira and not mentions_notion:
+        return (True, True, False)
+    elif mentions_github and mentions_notion and not mentions_jira:
+        return (True, False, True)
+    elif mentions_jira and mentions_notion and not mentions_github:
+        return (False, True, True)
+    elif mentions_github and mentions_jira and mentions_notion:
+        return (True, True, True)  # All platforms mentioned
     else:
         # No clear platform mentioned - use context
-        return (has_gh_context, has_jira_context)
+        return (has_gh_context, has_jira_context, has_notion_context)
 
 
 def _is_greeting(user_message: str) -> bool:
@@ -291,13 +358,79 @@ def _is_greeting(user_message: str) -> bool:
         return False
 
     msg_lower = user_message.lower().strip()
+    
+    # Simple word-based greeting detection (more reliable)
+    greeting_words = [
+        'hi', 'hello', 'hey', 'hii', 'hiii', 'helloo', 'heyyy',
+        'sup', 'howdy', 'greetings', 'hola', 'good morning', 
+        'good afternoon', 'good evening', 'whats up', "what's up",
+        'yo', 'hai', 'helo', 'hellooo'
+    ]
+    
+    # Remove punctuation for comparison
+    clean_msg = re.sub(r'[^\w\s]', '', msg_lower).strip()
+    
+    # Check for exact matches with greeting words
+    if clean_msg in greeting_words:
+        return True
+    
+    # Check for "how are you" variations
+    how_patterns = [
+        'how are you', 'how r u', 'how are u', 'how r you',
+        'hows it going', "how's it going", 'how you doing',
+        'how are things', 'how is everything'
+    ]
+    
+    if clean_msg in how_patterns:
+        return True
+    
+    # Check for simple greeting patterns at start of message
     greeting_patterns = [
-        r'^(hi|hello|hey|greetings|good\s+(morning|afternoon|evening))[\s!.]*$',
-        r'^(what\'s\s+up|sup|howdy)[\s!.]*$',
-        r'^(how\s+are\s+you|how\'s\s+it\s+going)[\s!.?]*$'
+        r'^(hi|hello|hey|hii|hiii|helloo|heyyy)[\s!.]*$',
+        r'^(what\'?s\s+up|sup|howdy)[\s!.]*$',
+        r'^(how\s+(are\s+you|r\s+u|you\s+doing|are\s+things))[\s!.?]*$',
+        r'^(good\s+(morning|afternoon|evening|night))[\s!.]*$'
     ]
 
     return any(re.match(pattern, msg_lower) for pattern in greeting_patterns)
+
+
+def _is_casual_conversation(user_message: str) -> bool:
+    """Detect if message is casual conversation that doesn't need tool actions."""
+    if not user_message:
+        return False
+    
+    msg_lower = user_message.lower().strip()
+    
+    # Check for conversational patterns that don't require actions
+    conversational_patterns = [
+        r'^(thanks?|thank\s+you|thx)[\s!.]*$',
+        r'^(you\'?re\s+welcome|no\s+problem|no\s+worries)[\s!.]*$',
+        r'^(ok|okay|alright|sure|yes|yeah|yep|yup|no|nope)[\s!.]*$',
+        r'^(i\'?m\s+)?(fine|good|great|doing\s+(fine|good|great|well|ok|okay))[\s!.]*$',
+        r'^(how\s+(about|are)\s+you|what\s+about\s+you)[\s!.?]*$',
+        r'^(nice|cool|awesome|sweet|good\s+to\s+(know|hear))[\s!.]*$',
+        r'^(bye|goodbye|see\s+you|talk\s+to\s+you\s+later|ttyl)[\s!.]*$',
+        r'^\w+\s+(to\s+(know|hear)|that|too)[\s!.]*$',  # "good to know", "nice that", etc.
+        r'^(sounds?\s+(good|great|nice|cool)|that\'?s\s+(good|great|nice|cool|awesome))[\s!.]*$'
+    ]
+    
+    # Additional conversational indicators
+    casual_keywords = ['doing', 'feeling', 'going', 'day', 'weather', 'weekend', 'morning', 'afternoon', 'evening']
+    task_keywords = ['create', 'make', 'show', 'list', 'get', 'find', 'search', 'update', 'delete', 'add', 'remove', 'github', 'jira', 'notion', 'issue', 'ticket', 'page', 'database']
+    
+    # Check if it's a conversational response
+    if any(re.match(pattern, msg_lower) for pattern in conversational_patterns):
+        return True
+        
+    # If it contains casual words but no task words, likely conversational
+    has_casual = any(word in msg_lower for word in casual_keywords)
+    has_task = any(word in msg_lower for word in task_keywords)
+    
+    if has_casual and not has_task and len(user_message.split()) <= 8:
+        return True
+    
+    return False
 
 
 def _detect_status_change_intent(user_message: str) -> Optional[Tuple[str, str]]:
@@ -396,13 +529,17 @@ def _build_github_search_query(user_message: str, owner: str, repo: str, item_ty
 def _build_optimized_system_prompt(
         allow_gh: bool,
         allow_jira: bool,
+        allow_notion: bool,
         intent_hash: str
 ) -> str:
-    """Cached system prompt generation with intent-based optimization."""
+    """Cached system prompt generation with intent-based optimization including Notion."""
 
     # Build contextual tool list based on intent
-    if allow_gh and allow_jira:
-        tool_sections = [
+    tool_sections = []
+    routing_rules = []
+
+    if allow_gh:
+        tool_sections.extend([
             "GitHub Tools (service='github'):",
             "- gh_get_issue(owner, repo, issue_number) - Get specific issue details",
             "- gh_search_issues(query, per_page?) - Search issues (query REQUIRED)",
@@ -416,60 +553,60 @@ def _build_optimized_system_prompt(
             "- gh_create_or_update_file(owner, repo, path, content, message, branch?) - Create/update file",
             "- gh_list_tags(owner, repo) - List tags",
             "... and many more GitHub operations for workflows, security, etc.",
-            "",
+            ""
+        ])
+
+    if allow_jira:
+        tool_sections.extend([
             "Jira Tools (service='jira'):",
-            *[f"- {t.signature}" for t in JIRA_TOOLS],  # All Jira tools
-        ]
-        routing_rules = [
-            "- Analyze user intent to choose the appropriate platform",
-            "- For repository operations (owner/repo), use GitHub tools",
-            "- For issue tracking (project keys, JQL), use Jira tools",
-            "- If both platforms mentioned, create coordinated actions"
-        ]
-    elif allow_gh:
-        tool_sections = [
-            "Available GitHub Tools:",
-            "- gh_get_issue(owner, repo, issue_number) - Get specific issue details",
-            "- gh_search_issues(query, per_page?) - Search issues (query REQUIRED)",
-            "- gh_create_issue(owner, repo, title, body?) - Create new issue",
-            "- gh_update_issue(owner, repo, issue_number, state?, title?, body?) - Update issue",
-            "- gh_add_issue_comment(owner, repo, issue_number, body) - Add comment",
-            "- gh_list_issues(owner, repo, state?, labels?) - List issues",
-            "- gh_create_pull_request(owner, repo, title, head, base, body?) - Create PR",
-            "- gh_list_branches(owner, repo) - List branches",
-            "- gh_get_file_contents(owner, repo, path, ref?) - Get file contents",
-            "- gh_create_or_update_file(owner, repo, path, content, message, branch?) - Create/update file",
-            "- gh_list_tags(owner, repo) - List tags",
-            "... and additional operations for security, notifications, workflows, etc.",
-        ]
-        routing_rules = [
-            "- Use ONLY GitHub tools",
-            "- Extract owner/repo from user input",
-            "- Focus on repository-based operations"
-        ]
-    elif allow_jira:
-        tool_sections = [
-            "Available Jira Tools:",
             *[f"- {t.signature}" for t in JIRA_TOOLS],
-        ]
+            ""
+        ])
+
+    if allow_notion:
+        tool_sections.extend([
+            "Notion Tools (service='notion'):",
+            *[f"- {t.signature}" for t in NOTION_TOOLS],
+            ""
+        ])
+
+    if allow_gh or allow_jira or allow_notion:
         routing_rules = [
-            "- Use ONLY Jira tools",
-            "- Focus on issue tracking operations",
-            "- Use provided project keys"
+            "- Analyze user intent to choose the appropriate platform(s)",
+            "- For repository operations (owner/repo), use GitHub tools",
+            "- For issue tracking (project keys, JQL), use Jira tools", 
+            "- For document/page management, use Notion tools",
+            "- Multiple platforms can be used together when appropriate"
         ]
     else:
         tool_sections = ["No tools available"]
         routing_rules = ["- Return empty actions array"]
 
-    return f"""You are an intelligent task planner. Analyze the user request and generate an optimized execution plan.
+    return f"""You are an intelligent task assistant with advanced understanding and memory capabilities. You help users manage GitHub, Jira, and Notion efficiently by:
+
+1. **UNDERSTANDING USER INTENT**: Carefully analyze what the user wants to accomplish
+2. **GATHERING INFORMATION**: If you need more information to complete a task, ask specific questions
+3. **INTELLIGENT EXECUTION**: Plan and execute the most effective approach
+4. **CLEAR COMMUNICATION**: Provide helpful, specific responses
 
 RESPONSE FORMAT (JSON only):
 {{
   "message": "Brief response to user - NO MARKDOWN TABLES, just summary text",
   "actions": [
     {{"service": "github|jira|notion", "action": "tool_name", "args": {{"param": "value"}}, "description": "what this does"}},
-  ]
+  ],
+  "needs_info": false,
+  "question": ""
 }}
+
+**INFORMATION GATHERING BEHAVIOR**:
+- If task requires missing information (like issue numbers, page IDs, specific titles), set "needs_info": true and ask a specific question
+- Examples of when to ask:
+  * "Update issue X" without issue number → ask "Which issue number should I update?"  
+  * "Create database under page Y" without page ID → ask "What's the page ID or name where you want the database?"
+  * "Assign issue to user Z" without knowing assignee → ask "Who should be assigned to this issue?"
+- Only ask for ONE piece of information at a time for better user experience
+- Be specific about what format you need (e.g., "issue number like #123" or "Jira key like ABC-123")
 
 {chr(10).join(tool_sections)}
 
@@ -529,7 +666,16 @@ CRITICAL ENTITY NORMALIZATION RULES:
     - "Mark Jira issue ABC-123 to Done" → list_transitions + transition_issue
     - "Add comment to ABC-123" → add_comment(issue_key="ABC-123", body="...")
 
-11. ENHANCED ERROR HANDLING:
+11. NOTION OPERATIONS:
+    - "Tell me what I have in Notion" → query_database(database_id) to list all pages
+    - "Create a Notion page" → create_page(parent_database_id, properties)
+    - "Search Notion for X" → search(query="X") 
+    - "Show Notion page Y" → search(query="Y") first, then get_page if specific page found
+    - Always use query_database for listing/browsing database contents
+    - Use get_page only when you have a specific page_id (not database_id)
+    - For "what do I have" queries, use query_database to show all pages
+
+12. ENHANCED ERROR HANDLING:
     - For search operations that might return no results, always include helpful message
     - For Jira transitions, always get available transitions first
     - For PR creation, validate all required parameters are present
@@ -642,7 +788,8 @@ def _parse_llm_response(raw_response: str) -> Dict[str, Any]:
 def _validate_and_filter_actions(
         actions: List[Dict[str, Any]],
         allow_gh: bool,
-        allow_jira: bool
+        allow_jira: bool,
+        allow_notion: bool = True
 ) -> List[Dict[str, Any]]:
     """Validate and filter actions based on platform permissions."""
     if not isinstance(actions, list):
@@ -671,9 +818,11 @@ def _validate_and_filter_actions(
             tool_name = f"jira_{action_name}" if not action_name.startswith("jira_") else action_name
             if any(t.name == tool_name for t in JIRA_TOOLS):
                 valid_actions.append(action)
-        elif service == "notion":
-            # Keep notion actions as-is for compatibility
-            valid_actions.append(action)
+        elif service == "notion" and allow_notion:
+            # Validate Notion tool exists
+            tool_name = f"notion_{action_name}" if not action_name.startswith("notion_") else action_name
+            if any(t.name == tool_name for t in NOTION_TOOLS):
+                valid_actions.append(action)
 
     return valid_actions
 
@@ -843,6 +992,46 @@ def propose_actions(
                 "greeting": True
             }
         }
+    
+    # Check for casual conversation that doesn't need actions
+    if _is_casual_conversation(user_message):
+        # Generate a natural conversational response
+        conversational_responses = {
+            "doing great": "That's awesome! How can I help you today?",
+            "doing good": "Great to hear! What can I assist you with?",
+            "i'm good": "Wonderful! What would you like to work on?",
+            "fine": "Good to hear! Anything I can help you with?",
+            "good": "Excellent! How can I assist you today?",
+            "great": "That's fantastic! What can I do for you?",
+            "thanks": "You're welcome! Is there anything else I can help with?",
+            "thank you": "My pleasure! Let me know if you need anything else.",
+            "ok": "Perfect! How can I help you next?",
+            "okay": "Great! What would you like to do?",
+            "how about you": "I'm doing great, thanks for asking! How can I help you today?",
+            "what about you": "I'm doing well! What can I assist you with?",
+            "nice": "Thank you! Is there anything specific you'd like to work on?",
+            "cool": "Glad you think so! What can I help you with next?"
+        }
+        
+        # Find best matching response
+        msg_lower = user_message.lower().strip()
+        response_message = "That's great! How can I help you today?"
+        
+        for key, response in conversational_responses.items():
+            if key in msg_lower:
+                response_message = response
+                break
+        
+        return {
+            "message": response_message,
+            "actions": [],
+            "metadata": {
+                "execution_time": time.time() - start_time,
+                "model": model,
+                "attempts": 1,
+                "conversational": True
+            }
+        }
 
     # Extract repository info if not provided
     if not (gh_owner and gh_repo):
@@ -853,7 +1042,8 @@ def propose_actions(
     # Determine platform intent
     has_gh_ctx = bool(gh_owner and gh_repo)
     has_jira_ctx = bool(jira_project_key)
-    allow_gh, allow_jira = _infer_platform_intent(user_message, has_gh_ctx, has_jira_ctx)
+    has_notion_ctx = bool(notion_database_id)
+    allow_gh, allow_jira, allow_notion = _infer_platform_intent(user_message, has_gh_ctx, has_jira_ctx, has_notion_ctx)
 
     # Build context efficiently
     context_parts = []
@@ -861,14 +1051,16 @@ def propose_actions(
         context_parts.append(f"GitHub: {gh_owner}/{gh_repo}")
     if jira_project_key and allow_jira:
         context_parts.append(f"Jira: {jira_project_key}")
+    if notion_database_id and allow_notion:
+        context_parts.append(f"Notion: {notion_database_id}")
 
     context = " | ".join(context_parts) if context_parts else "No specific context"
 
     # Generate intent hash for caching
-    intent_hash = hash(f"{allow_gh}:{allow_jira}:{user_message[:100]}")
+    intent_hash = hash(f"{allow_gh}:{allow_jira}:{allow_notion}:{user_message[:100]}")
 
     # Get optimized system prompt
-    system_prompt = _build_optimized_system_prompt(allow_gh, allow_jira, str(intent_hash))
+    system_prompt = _build_optimized_system_prompt(allow_gh, allow_jira, allow_notion, str(intent_hash))
 
     # Build messages
     messages = [
@@ -906,9 +1098,25 @@ def propose_actions(
         parsed = _parse_llm_response(raw_response)
         actions = parsed.get("actions", [])
         message = parsed.get("message", "Task processed")
+        needs_info = parsed.get("needs_info", False)
+        question = parsed.get("question", "")
+
+        # If the model needs more information, return immediately without processing actions
+        if needs_info and question:
+            return {
+                "message": question,
+                "actions": [],
+                "needs_info": True,
+                "metadata": {
+                    "execution_time": time.time() - start_time,
+                    "model": model,
+                    "attempts": attempt + 1,
+                    "information_request": True
+                }
+            }
 
         # Validate and filter actions
-        valid_actions = _validate_and_filter_actions(actions, allow_gh, allow_jira)
+        valid_actions = _validate_and_filter_actions(actions, allow_gh, allow_jira, allow_notion)
 
         # Enhance actions with context-specific improvements
         enhanced_actions = _enhance_actions_for_context(valid_actions, user_message, gh_owner or "", gh_repo or "")
@@ -925,7 +1133,8 @@ def propose_actions(
                 "attempts": attempt + 1,
                 "platforms": {
                     "github": allow_gh,
-                    "jira": allow_jira
+                    "jira": allow_jira,
+                    "notion": allow_notion
                 },
                 "context": context,
                 "original_action_count": len(actions),
@@ -985,7 +1194,6 @@ def propose_actions_batch(
 # Cache management utilities
 def clear_caches():
     """Clear all caches to free memory."""
-    _get_repo_patterns.cache_clear()
     _extract_owner_repo.cache_clear()
     _extract_issue_number.cache_clear()
     _extract_jira_key.cache_clear()

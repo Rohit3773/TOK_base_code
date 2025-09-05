@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)",
+      "Read(/C:\\Users\\rohit\\OneDrive\\Desktop\\TOK/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
