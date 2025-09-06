@@ -133,6 +133,7 @@ class GitHubClient:
                               'gitignore_template', 'license_template'},
         'list_repositories': {'visibility', 'affiliation', 'type', 'sort', 'direction', 'per_page', 'page'},
         'list_repository_contents': {'path', 'ref'},
+        'search_file_across_repositories': {'filename'},
         'fork_repository': {'organization'},
         'create_branch': {'branch', 'from_branch'},
         'list_branches': {'protected', 'per_page', 'page'},
@@ -702,6 +703,85 @@ class GitHubClient:
         params = {"ref": ref} if ref else {}
 
         return self._request("GET", f"/repos/{owner}/{repo}/contents/{path}", params=params)
+    
+    def search_file_across_repositories(self, filename: str, **kwargs) -> Dict[str, Any]:
+        """Search for a file across all user repositories recursively."""
+        try:
+            # First get all repositories
+            repos_result = self.list_repositories()
+            if not isinstance(repos_result, list):
+                return {'error': 'Could not retrieve repositories list'}
+            
+            found_files = []
+            
+            def search_in_directory(owner, repo_name, path="", visited_paths=None):
+                """Recursively search for the file in directories."""
+                if visited_paths is None:
+                    visited_paths = set()
+                
+                # Avoid infinite loops
+                current_key = f"{owner}/{repo_name}/{path}"
+                if current_key in visited_paths or len(visited_paths) > 50:  # Limit depth
+                    return
+                visited_paths.add(current_key)
+                
+                try:
+                    contents = self.list_repository_contents(path=path, owner=owner, repo=repo_name)
+                    if isinstance(contents, list):
+                        for item in contents:
+                            if not isinstance(item, dict):
+                                continue
+                                
+                            item_name = item.get('name', '')
+                            item_path = item.get('path', '')
+                            item_type = item.get('type', '')
+                            
+                            # Found the file!
+                            if item_name == filename and item_type == 'file':
+                                found_files.append({
+                                    'repository': f"{owner}/{repo_name}",
+                                    'owner': owner,
+                                    'repo': repo_name,
+                                    'path': item_path,
+                                    'type': item_type,
+                                    'size': item.get('size'),
+                                    'download_url': item.get('download_url'),
+                                    'html_url': item.get('html_url')
+                                })
+                            
+                            # If it's a directory, search recursively
+                            elif item_type == 'dir' and len(visited_paths) < 20:  # Limit recursion depth
+                                search_in_directory(owner, repo_name, item_path, visited_paths.copy())
+                                
+                except Exception:
+                    # Skip directories we can't access
+                    pass
+            
+            for repo in repos_result:
+                if not isinstance(repo, dict):
+                    continue
+                    
+                repo_name = repo.get('name')
+                owner = repo.get('owner', {}).get('login') if isinstance(repo.get('owner'), dict) else None
+                
+                if not repo_name or not owner:
+                    continue
+                
+                # Search recursively starting from root
+                search_in_directory(owner, repo_name)
+                
+                # Limit total files found to prevent overwhelming results
+                if len(found_files) >= 10:
+                    break
+            
+            return {
+                'filename': filename,
+                'found_in': found_files,
+                'total_found': len(found_files)
+            }
+            
+        except Exception as e:
+            return {'error': f'Search failed: {str(e)}'}
 
     def push_files(self, branch: str, files: List[Dict[str, str]], message: str,
                    owner: str = "", repo: str = "", **kwargs) -> Dict[str, Any]:

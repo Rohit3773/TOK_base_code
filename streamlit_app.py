@@ -563,6 +563,7 @@ def execute_github_action(client, tool: str, args: dict) -> dict:
             # Repository and Files
             'list_repositories': lambda: client.list_repositories(**args),
             'list_repository_contents': lambda: client.list_repository_contents(**args),
+            'search_file_across_repositories': lambda: client.search_file_across_repositories(**args),
             'get_repository': lambda: client.get_repository(**args),
             'create_branch': lambda: client.create_branch(**args),
             'list_branches': lambda: client.list_branches(**args),
@@ -1744,6 +1745,7 @@ def format_execution_results_with_tables(results: List[Dict]) -> Tuple[str, List
             if data == default_data and isinstance(result_data, list):
                 data = result_data
                 logger.info("DEBUG - Using result_data directly as it's a list")
+                logger.info(f"DEBUG - result_data length: {len(result_data)}, first item: {result_data[0] if result_data else 'Empty list'}")
             
             # Method 3: If result_data has 'success' field, the actual data might be the whole result_data minus metadata
             elif data == default_data and isinstance(result_data, dict) and 'success' in result_data:
@@ -2024,7 +2026,7 @@ def format_execution_results_with_tables(results: List[Dict]) -> Tuple[str, List
                                 summary_parts.append(f"   Debug: Data content: {str(data)[:200]}...")
 
                 elif raw_action == 'list_repository_contents':
-                    # Handle repository contents listing
+                    # Handle repository contents listing with enhanced debugging
                     owner = raw_args.get('owner', 'Repository')
                     repo = raw_args.get('repo', '')
                     path = raw_args.get('path', '')
@@ -2033,26 +2035,129 @@ def format_execution_results_with_tables(results: List[Dict]) -> Tuple[str, List
                     repo_display = f"{owner}/{repo}" if owner and repo else "Repository"
                     path_display = f" at path '{path}'" if path else ""
                     
+                    logger.info(f"Repository contents data type: {type(data)}")
+                    logger.info(f"Repository contents data length: {len(data) if hasattr(data, '__len__') else 'N/A'}")
+                    logger.info(f"Repository contents data content: {str(data)[:500]}...")
+                    logger.info(f"Is data a list? {isinstance(data, list)}")
+                    logger.info(f"Is data equal to default_data? {data == default_data}")
+                    logger.info(f"default_data value: {default_data}")
+                    
                     if isinstance(data, list):
                         summary_parts.append(f"GitHub: Found {len(data)} items in {repo_display}{path_display}")
                         if data:
+                            logger.info(f"First content item keys: {list(data[0].keys()) if data and isinstance(data[0], dict) else 'Not a dict'}")
                             df = create_github_contents_dataframe(data)
                             if not df.empty:
                                 dataframes.append(df)
-                                table_titles.append(f"Contents of {repo_display}")
+                                table_titles.append(f"Contents of {repo_display}{path_display}")
                                 # Show quick summary
                                 files_count = sum(1 for item in data if item.get('type') == 'file')
                                 dirs_count = sum(1 for item in data if item.get('type') == 'dir')
                                 summary_parts.append(f"   Summary: {files_count} files, {dirs_count} directories")
+                            else:
+                                summary_parts.append("   Note: Contents data could not be formatted into table")
+                        else:
+                            summary_parts.append("   No contents found")
                     else:
-                        summary_parts.append(f"GitHub: Contents retrieved for {repo_display}")
-                        # Try to extract contents data anyway
+                        summary_parts.append(f"GitHub: Contents retrieved for {repo_display} (type: {type(data)})")
+                        logger.info(f"Non-list contents data: {data}")
+                        # Try to extract contents data anyway with more aggressive search
                         if data:
-                            try_data = [data] if isinstance(data, dict) else data
-                            df = create_github_contents_dataframe(try_data)
-                            if not df.empty:
-                                dataframes.append(df)
-                                table_titles.append(f"Contents of {repo_display}")
+                            try_data = []
+                            if isinstance(data, dict):
+                                # Maybe contents are nested in the dict
+                                for key, value in data.items():
+                                    if isinstance(value, list) and value and isinstance(value[0], dict):
+                                        # Found a list of dicts, this might be contents
+                                        if any(content_field in str(value[0]) for content_field in ['name', 'path', 'type', 'size']):
+                                            try_data = value
+                                            logger.info(f"Found repository contents in field '{key}'")
+                                            break
+                            elif isinstance(data, list):
+                                try_data = data
+                            
+                            if try_data:
+                                df = create_github_contents_dataframe(try_data)
+                                if not df.empty:
+                                    dataframes.append(df)
+                                    table_titles.append(f"Contents of {repo_display}{path_display}")
+                                    summary_parts.append(f"   Found {len(try_data)} items")
+                                else:
+                                    summary_parts.append("   Note: Contents data could not be formatted into table")
+                                    # Show debug info
+                                    if try_data:
+                                        summary_parts.append(f"   Debug: Sample item keys: {list(try_data[0].keys()) if isinstance(try_data[0], dict) else 'Not a dict'}")
+                            else:
+                                summary_parts.append("   No recognizable contents data found")
+                                summary_parts.append(f"   Debug: Data content: {str(data)[:200]}...")
+
+                elif raw_action == 'search_file_across_repositories':
+                    # Handle file search across repositories
+                    filename = raw_args.get('filename', 'Unknown file')
+                    
+                    if isinstance(data, dict):
+                        total_found = data.get('total_found', 0)
+                        found_files = data.get('found_in', [])
+                        
+                        if total_found > 0:
+                            summary_parts.append(f"GitHub: Found '{filename}' in {total_found} location(s)")
+                            
+                            # Show where files were found
+                            for i, file_info in enumerate(found_files[:3]):  # Show first 3
+                                repo_name = file_info.get('repository', 'Unknown')
+                                file_path = file_info.get('path', filename)
+                                size = file_info.get('size', 0)
+                                size_str = f" ({size} bytes)" if size else ""
+                                summary_parts.append(f"   📄 {repo_name}/{file_path}{size_str}")
+                            
+                            if len(found_files) > 3:
+                                summary_parts.append(f"   ... and {len(found_files) - 3} more")
+                            
+                            # Automatically get contents of the first file found
+                            if total_found >= 1:
+                                try:
+                                    file_info = found_files[0]
+                                    owner = file_info.get('owner')
+                                    repo = file_info.get('repo')
+                                    path = file_info.get('path')
+                                    
+                                    if owner and repo and path:
+                                        summary_parts.append(f"\n📖 Contents of {filename}:")
+                                        summary_parts.append("=" * 50)
+                                        
+                                        # Get file contents using the GitHub client
+                                        github_client = st.session_state.get('github_client')
+                                        if github_client:
+                                            file_contents = github_client.get_file_contents(path=path, owner=owner, repo=repo)
+                                            
+                                            if isinstance(file_contents, dict) and 'content' in file_contents:
+                                                # Decode base64 content
+                                                import base64
+                                                try:
+                                                    content = base64.b64decode(file_contents['content']).decode('utf-8')
+                                                    
+                                                    # Show file contents with line numbers
+                                                    lines = content.split('\n')
+                                                    for line_num, line in enumerate(lines[:100], 1):  # Show first 100 lines
+                                                        summary_parts.append(f"{line_num:3d}: {line}")
+                                                    
+                                                    if len(lines) > 100:
+                                                        summary_parts.append(f"... ({len(lines) - 100} more lines)")
+                                                    
+                                                    summary_parts.append("=" * 50)
+                                                except Exception as decode_error:
+                                                    summary_parts.append(f"   Error decoding file: {str(decode_error)}")
+                                                    summary_parts.append("   File might be binary or use different encoding")
+                                            else:
+                                                summary_parts.append("   Could not decode file contents")
+                                                
+                                except Exception as e:
+                                    summary_parts.append(f"   Error retrieving contents: {str(e)}")
+                        else:
+                            summary_parts.append(f"GitHub: '{filename}' not found in any repositories")
+                            summary_parts.append("   Try checking if the filename is correct or search with a different name")
+                    else:
+                        summary_parts.append(f"GitHub: File search completed for '{filename}'")
 
                 else:
                     summary_parts.append(f"GitHub: {action} completed")
